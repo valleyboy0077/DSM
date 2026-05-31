@@ -56,7 +56,7 @@ export default function TempProfiles() {
     <div>
       <div className="toolbar">
         <h2 style={{fontSize: 18}}>Temperature Profiles</h2>
-        <button className="btn btn-primary" onClick={() => { setEditingProfile({ id: 0, server_id: serverId, is_default: false, name: 'New Profile', ranges: [] }); setRanges(DEFAULT_RANGES); }}>
+        <button className="btn btn-primary" onClick={() => { setEditingProfile({ id: 0, server_id: serverId, server_name: null, is_default: false, name: 'New Profile', ranges: [], created_at: null, updated_at: null } as TempProfile); setRanges(DEFAULT_RANGES); }}>
           + New Profile
         </button>
       </div>
