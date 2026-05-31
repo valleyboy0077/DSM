@@ -1,0 +1,102 @@
+"""Dell Server Manager - FastAPI application entry point v2.
+
+Manages app lifecycle, registers all API routers, serves the React SPA,
+and seeds default data (roles, admin user) on startup.
+"""
+
+import logging
+import os
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+from dsm import __version__
+from dsm.api.auth import router as auth_router
+from dsm.api.fans import router as fans_router
+from dsm.api.groups import router as groups_router
+from dsm.api.health import router as health_router
+from dsm.api.servers import router as servers_router
+from dsm.api.settings import router as settings_router
+from dsm.api.sensors import router as sensors_router, poller
+from dsm.api.temp_profiles import router as temp_profiles_router
+from dsm.api.users import router as users_router
+from dsm.auth import seed_default_roles, seed_default_admin
+from dsm.config import settings
+from dsm.database import init_db, async_session
+
+logging.basicConfig(
+    level=logging.DEBUG if settings.debug else logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan handler."""
+    logger.info(f"DSM v{__version__} starting...")
+
+    # Initialize database
+    await init_db()
+
+    # Seed default data
+    async with async_session() as session:
+        await seed_default_roles(session)
+        await seed_default_admin(session)
+
+    # Start background services
+    await poller.start()
+    logger.info("DSM started - database initialized, roles seeded, sensor polling active")
+
+    yield
+
+    logger.info("DSM shutting down...")
+    await poller.stop()
+    logger.info("DSM stopped")
+
+
+app = FastAPI(
+    title="Dell Server Manager",
+    description="Unified management for Dell PowerEdge servers via iDRAC",
+    version=__version__,
+    lifespan=lifespan,
+)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ─── Public ──────────────────────────────────────────────────────────────────
+app.include_router(health_router)
+
+# ─── Auth ────────────────────────────────────────────────────────────────────
+app.include_router(auth_router)
+
+# ─── API Routers ─────────────────────────────────────────────────────────────
+app.include_router(servers_router)
+app.include_router(sensors_router)
+app.include_router(fans_router)
+app.include_router(users_router)
+app.include_router(groups_router)
+app.include_router(temp_profiles_router)
+app.include_router(settings_router)
+
+# ─── Frontend ────────────────────────────────────────────────────────────────
+frontend_dir = os.path.join(os.path.dirname(__file__), "frontend")
+if os.path.isdir(frontend_dir):
+    app.mount("/static", StaticFiles(directory=frontend_dir), name="static")
+
+    @app.get("/")
+    async def serve_frontend():
+        from fastapi.responses import FileResponse
+        index_path = os.path.join(frontend_dir, "index.html")
+        if os.path.exists(index_path):
+            return FileResponse(index_path)
+        return {"error": "Frontend not built."}
