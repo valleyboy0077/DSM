@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from dsm.auth import get_current_user, require_operator
 from dsm.database import get_session
-from dsm.models import Server, ServerGroup, server_group_members
+from dsm.models import Server, ServerGroup, server_group_members, User
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,7 @@ class GroupResponse(BaseModel):
 
 
 @router.get("/", response_model=list[GroupResponse])
-async def list_groups(_user: str = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+async def list_groups(_user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
     result = await session.execute(select(ServerGroup).order_by(ServerGroup.name))
     groups = result.scalars().all()
     response = []
@@ -55,7 +55,7 @@ async def list_groups(_user: str = Depends(get_current_user), session: AsyncSess
 
 
 @router.post("/", response_model=GroupResponse, status_code=201)
-async def create_group(data: GroupCreate, _admin: str = Depends(require_operator), session: AsyncSession = Depends(get_session)):
+async def create_group(data: GroupCreate, _admin: User = Depends(require_operator),session: AsyncSession = Depends(get_session)):
     existing = await session.execute(select(ServerGroup).where(ServerGroup.name == data.name))
     if existing.scalars().first():
         raise HTTPException(status_code=409, detail=f"Group '{data.name}' already exists")
@@ -67,7 +67,7 @@ async def create_group(data: GroupCreate, _admin: str = Depends(require_operator
 
 
 @router.put("/{group_id}", response_model=GroupResponse)
-async def update_group(group_id: int, data: GroupUpdate, _admin: str = Depends(require_operator), session: AsyncSession = Depends(get_session)):
+async def update_group(group_id: int, data: GroupUpdate, _admin: User = Depends(require_operator),session: AsyncSession = Depends(get_session)):
     group = await session.get(ServerGroup, group_id)
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
@@ -83,7 +83,7 @@ async def update_group(group_id: int, data: GroupUpdate, _admin: str = Depends(r
 
 
 @router.delete("/{group_id}", status_code=204)
-async def delete_group(group_id: int, _admin: str = Depends(require_operator), session: AsyncSession = Depends(get_session)):
+async def delete_group(group_id: int, _admin: User = Depends(require_operator),session: AsyncSession = Depends(get_session)):
     group = await session.get(ServerGroup, group_id)
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
@@ -92,7 +92,7 @@ async def delete_group(group_id: int, _admin: str = Depends(require_operator), s
 
 
 @router.post("/{group_id}/servers/{server_id}", status_code=201)
-async def add_server_to_group(group_id: int, server_id: int, _admin: str = Depends(require_operator), session: AsyncSession = Depends(get_session)):
+async def add_server_to_group(group_id: int, server_id: int, _admin: User = Depends(require_operator),session: AsyncSession = Depends(get_session)):
     group = await session.get(ServerGroup, group_id)
     server = await session.get(Server, server_id)
     if not group or not server:
@@ -107,7 +107,7 @@ async def add_server_to_group(group_id: int, server_id: int, _admin: str = Depen
 
 
 @router.delete("/{group_id}/servers/{server_id}", status_code=204)
-async def remove_server_from_group(group_id: int, server_id: int, _admin: str = Depends(require_operator), session: AsyncSession = Depends(get_session)):
+async def remove_server_from_group(group_id: int, server_id: int, _admin: User = Depends(require_operator),session: AsyncSession = Depends(get_session)):
     stmt = server_group_members.delete().where(
         (server_group_members.c.group_id == group_id) & (server_group_members.c.server_id == server_id)
     )
