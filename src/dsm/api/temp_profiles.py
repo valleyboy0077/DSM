@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from dsm.auth import get_current_user, require_operator
 from dsm.database import get_session
-from dsm.models import TempProfile, TempProfileRange, FanConfig, Server
+from dsm.models import TempProfile, TempProfileRange, FanConfig, Server, User
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,7 @@ class TempProfileResponse(BaseModel):
 @router.get("/server/{server_id}", response_model=list[TempProfileResponse])
 async def list_server_profiles(
     server_id: int,
-    _user: str = Depends(get_current_user),
+    _user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
     """List all temp profiles for a server."""
@@ -100,7 +100,7 @@ async def list_server_profiles(
 async def create_profile(
     server_id: int,
     data: TempProfileCreate,
-    _admin: str = Depends(require_operator),
+    _admin: User = Depends(require_operator),
     session: AsyncSession = Depends(get_session),
 ):
     """Create a temp profile for a server."""
@@ -145,7 +145,7 @@ async def create_profile(
 async def update_profile(
     profile_id: int,
     data: TempProfileCreate,
-    _admin: str = Depends(require_operator),
+    _admin: User = Depends(require_operator),
     session: AsyncSession = Depends(get_session),
 ):
     """Update a temp profile."""
@@ -194,7 +194,7 @@ async def update_profile(
 @router.delete("/{profile_id}", status_code=204)
 async def delete_profile(
     profile_id: int,
-    _admin: str = Depends(require_operator),
+    _admin: User = Depends(require_operator),
     session: AsyncSession = Depends(get_session),
 ):
     """Delete a temp profile."""
@@ -208,7 +208,7 @@ async def delete_profile(
 @router.get("/effective/{server_id}")
 async def get_effective_thresholds(
     server_id: int,
-    _user: str = Depends(get_current_user),
+    _user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
     """Get the effective (active) temperature thresholds for a server.

@@ -7,11 +7,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from dsm.auth import get_current_user, require_operator
+from dsm.auth import get_current_user
 from dsm.crypto import decrypt_ciphertext
 from dsm.database import get_session
 from dsm.idrac_connector import IdracConnector, IdracError, IdracConnectionError
-from dsm.models import Server
+from dsm.models import Server, User
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ async def _get_connector(server_id: int, session: AsyncSession) -> IdracConnecto
 @router.get("/network/{server_id}")
 async def get_network(
     server_id: int,
-    _user: str = Depends(require_operator),
+    _user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
     """Get iDRAC network settings."""
@@ -52,7 +52,7 @@ async def get_network(
 async def get_sel(
     server_id: int,
     clear: bool = False,
-    _user: str = Depends(require_operator),
+    _user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
     """Get System Event Log."""
@@ -70,7 +70,7 @@ async def get_sel(
 @router.get("/hardware/{server_id}")
 async def get_hardware(
     server_id: int,
-    _user: str = Depends(require_operator),
+    _user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
     """Get full hardware inventory."""
@@ -88,7 +88,7 @@ async def get_hardware(
 @router.get("/power/{server_id}")
 async def get_power_settings(
     server_id: int,
-    _user: str = Depends(require_operator),
+    _user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
     """Get power management settings."""
@@ -106,7 +106,7 @@ async def get_power_settings(
 @router.get("/storage/{server_id}")
 async def get_storage(
     server_id: int,
-    _user: str = Depends(require_operator),
+    _user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
     """Get RAID/storage configuration."""
@@ -124,7 +124,7 @@ async def get_storage(
 @router.get("/bios/{server_id}")
 async def get_bios(
     server_id: int,
-    _user: str = Depends(require_operator),
+    _user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
     """Get BIOS settings."""
@@ -142,7 +142,7 @@ async def get_bios(
 @router.get("/security/{server_id}")
 async def get_security(
     server_id: int,
-    _user: str = Depends(require_operator),
+    _user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
     """Get security settings."""
@@ -160,7 +160,7 @@ async def get_security(
 @router.get("/firmware/{server_id}")
 async def get_firmware(
     server_id: int,
-    _user: str = Depends(require_operator),
+    _user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
     """Get firmware info."""
@@ -178,7 +178,7 @@ async def get_firmware(
 @router.get("/alerts/{server_id}")
 async def get_alerts(
     server_id: int,
-    _user: str = Depends(require_operator),
+    _user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
     """Get alert/notification settings."""
@@ -196,7 +196,7 @@ async def get_alerts(
 @router.get("/virtual-media/{server_id}")
 async def get_virtual_media(
     server_id: int,
-    _user: str = Depends(require_operator),
+    _user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
     """Get virtual media status."""
@@ -214,7 +214,7 @@ async def get_virtual_media(
 @router.get("/idrac-users/{server_id}")
 async def get_idrac_users(
     server_id: int,
-    _user: str = Depends(require_operator),
+    _user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
     """List iDRAC user accounts on a server."""
