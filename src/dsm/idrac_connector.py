@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
-import aiohttp
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +74,7 @@ class IdracConnector:
         self.base_url = f"https://{ip}"
         self._drac_version: Optional[str] = None
         self._firmware_version: Optional[str] = None
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._client: Optional[httpx.AsyncClient] = None
         self._ssl_context = self._make_ssl_context()
 
     @staticmethod
@@ -85,31 +85,29 @@ class IdracConnector:
         ctx.verify_mode = ssl.CERT_NONE
         return ctx
 
-    async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            connector = aiohttp.TCPConnector(ssl=self._ssl_context)
-            self._session = aiohttp.ClientSession(
-                connector=connector,
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                verify=self._ssl_context,
+                timeout=httpx.Timeout(15.0, connect=5.0),
                 headers={"Accept": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=15, connect=5),
+                auth=httpx.BasicAuth(self.username, self.password),
             )
-        return self._session
+        return self._client
 
     async def close(self):
-        if self._session and not self._session.closed:
-            await self._session.close()
-            self._session = None
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+            self._client = None
 
     async def _request(self, path: str, method: str = "GET", json_body=None) -> dict:
         """Make an authenticated Redfish request."""
-        session = await self._get_session()
+        client = await self._get_client()
         url = f"{self.base_url}{path}"
-        auth = aiohttp.BasicAuth(self.username, self.password)
 
         kwargs = {
             "method": method,
             "url": url,
-            "auth": auth,
         }
 
         if json_body is not None:
@@ -117,20 +115,26 @@ class IdracConnector:
             kwargs["headers"] = {"Content-Type": "application/json", "Accept": "application/json"}
 
         try:
-            async with session.request(**kwargs) as resp:
-                data = await resp.json()
-                if resp.status >= 400:
-                    error_msg = data.get("error", {}).get("message", str(data))
-                    logger.warning(f"iDRAC {self.ip} {resp.status}: {error_msg}")
-                    raise IdracError(f"HTTP {resp.status}: {error_msg}")
-                return data
-        except aiohttp.ClientError as e:
+            resp = await client.request(**kwargs)
+            resp.raise_for_status()
+            data = resp.json()
+            return data
+        except httpx.HTTPStatusError as e:
+            error_msg = ""
+            try:
+                error_data = e.response.json()
+                error_msg = error_data.get("error", {}).get("message", str(error_data))
+            except Exception:
+                error_msg = e.response.text[:200]
+            logger.warning(f"iDRAC {self.ip} {e.response.status_code}: {error_msg}")
+            raise IdracError(f"HTTP {e.response.status_code}: {error_msg}")
+        except httpx.HTTPError as e:
             raise IdracConnectionError(f"Connection to {self.ip} failed: {e}")
 
     async def _request_wsman(self, xml_body: str) -> str:
         """Make a WS-Man SOAP request. Returns raw XML response."""
         import base64
-        session = await self._get_session()
+        client = await self._get_client()
         url = f"{self.base_url}/wsman"
         credentials = base64.b64encode(f"{self.username}:{self.password}".encode()).decode()
 
@@ -140,16 +144,15 @@ class IdracConnector:
             "Accept": "application/soap+xml",
         }
 
-        connector = aiohttp.TCPConnector(ssl=self._ssl_context)
         try:
-            async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=15, connect=5)) as ws_session:
-                async with ws_session.post(url, headers=headers, data=xml_body.encode()) as resp:
-                    text = await resp.text()
-                    if resp.status >= 400:
-                        logger.warning(f"WS-Man {self.ip} {resp.status}: {text[:200]}")
-                        raise IdracError(f"WS-Man HTTP {resp.status}")
-                    return text
-        except aiohttp.ClientError as e:
+            resp = await client.post(url, headers=headers, content=xml_body.encode())
+            resp.raise_for_status()
+            text = resp.text
+            return text
+        except httpx.HTTPStatusError as e:
+            logger.warning(f"WS-Man {self.ip} {e.response.status_code}: {e.response.text[:200]}")
+            raise IdracError(f"WS-Man HTTP {e.response.status_code}")
+        except httpx.HTTPError as e:
             raise IdracConnectionError(f"WS-Man connection to {self.ip} failed: {e}")
 
     async def detect_version(self) -> SystemInfo:
