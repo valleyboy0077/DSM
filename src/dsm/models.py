@@ -15,7 +15,7 @@ from typing import Optional
 from sqlalchemy import (
     Boolean,
     Column,
-    Enum,
+    Enum as SAEnum,
     Float,
     ForeignKey,
     Integer,

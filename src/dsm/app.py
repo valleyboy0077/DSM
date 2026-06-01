@@ -93,10 +93,26 @@ frontend_dir = os.path.join(os.path.dirname(__file__), "frontend")
 if os.path.isdir(frontend_dir):
     app.mount("/static", StaticFiles(directory=frontend_dir), name="static")
 
+    index_path = os.path.join(frontend_dir, "index.html")
+
     @app.get("/")
     async def serve_frontend():
         from fastapi.responses import FileResponse
-        index_path = os.path.join(frontend_dir, "index.html")
+        if os.path.exists(index_path):
+            return FileResponse(index_path)
+        return {"error": "Frontend not built."}
+
+    # Catch-all for SPA client-side routing
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        """Serve the React SPA for all non-API routes."""
+        # Don't interfere with API routes
+        if full_path.startswith(("auth/", "servers/", "sensors/", "fans/",
+                                 "users/", "groups/", "temp-profiles/",
+                                 "settings/", "health", "info")):
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404)
+        from fastapi.responses import FileResponse
         if os.path.exists(index_path):
             return FileResponse(index_path)
         return {"error": "Frontend not built."}

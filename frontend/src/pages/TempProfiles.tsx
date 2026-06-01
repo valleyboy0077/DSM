@@ -49,7 +49,14 @@ export default function TempProfiles() {
   };
 
   if (!serverId) {
-    return <div className="container"><p>Select a server first to manage temp profiles.</p></div>;
+    return (
+      <div className="container">
+        <div className="card" style={{textAlign: 'center', padding: 40}}>
+          <h2 style={{fontSize: 18, marginBottom: 12}}>No Server Selected</h2>
+          <p style={{color: 'var(--text-secondary)'}}>Select a server from Inventory first, or navigate to <a href="/temp-profiles?server_id=1">/temp-profiles?server_id=1</a></p>
+        </div>
+      </div>
+    );
   }
 
   return (
