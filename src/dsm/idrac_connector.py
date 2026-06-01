@@ -87,7 +87,9 @@ class IdracConnector:
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
+            connector = aiohttp.TCPConnector(ssl=self._ssl_context)
             self._session = aiohttp.ClientSession(
+                connector=connector,
                 headers={"Accept": "application/json"},
                 timeout=aiohttp.ClientTimeout(total=15, connect=5),
             )

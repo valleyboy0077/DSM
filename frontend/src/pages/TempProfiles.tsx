@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { api } from '../api';
-import type { TempProfile, TempRange } from '../types';
+import type { Server, TempProfile, TempRange } from '../types';
 
 const DEFAULT_RANGES: TempRange[] = [
   { id: 0, component_type: 'cpu', component_label: 'CPU 1', temp_min: 45, temp_max: 70, warning_min: null, warning_max: 60, critical_min: null, critical_max: 85 },
@@ -12,21 +12,61 @@ const DEFAULT_RANGES: TempRange[] = [
 ];
 
 export default function TempProfiles() {
-  const [searchParams] = useSearchParams();
-  const serverId = parseInt(searchParams.get('server_id') || '0');
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [servers, setServers] = useState<Server[]>([]);
+  const [selectedServerId, setSelectedServerId] = useState<number | null>(null);
+  const serverId = selectedServerId || parseInt(searchParams.get('server_id') || '', 10) || null;
   const [profiles, setProfiles] = useState<TempProfile[]>([]);
   const [editingProfile, setEditingProfile] = useState<TempProfile | null>(null);
   const [ranges, setRanges] = useState<TempRange[]>(DEFAULT_RANGES);
+  const [loading, setLoading] = useState(true);
+
+  const fetchServers = useCallback(async () => {
+    try {
+      const list = await api.listServers();
+      setServers(list);
+    } catch { /* ignore */ }
+  }, []);
 
   const fetchProfiles = useCallback(async () => {
-    if (!serverId) return;
-    try { setProfiles(await api.listProfiles(serverId)); } catch {}
+    if (!serverId) {
+      setProfiles([]);
+      setLoading(false);
+      return;
+    }
+    try {
+      setLoading(true);
+      const list = await api.listProfiles(serverId);
+      setProfiles(list);
+    } catch { /* ignore */ } finally {
+      setLoading(false);
+    }
   }, [serverId]);
 
-  useEffect(() => { fetchProfiles(); }, [fetchProfiles]);
+  useEffect(() => {
+    fetchServers();
+  }, [fetchServers]);
+
+  useEffect(() => {
+    fetchProfiles();
+  }, [fetchProfiles]);
+
+  useEffect(() => {
+    // When servers load, auto-select the first one if no selection yet
+    if (servers.length > 0 && !serverId) {
+      setSelectedServerId(servers[0].id);
+      setSearchParams({ server_id: String(servers[0].id) });
+    }
+  }, [servers, serverId, setSearchParams]);
+
+  const handleServerChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const id = parseInt(e.target.value, 10);
+    setSelectedServerId(id);
+    setSearchParams({ server_id: String(id) });
+  };
 
   const handleSave = async () => {
-    if (!editingProfile) return;
+    if (!editingProfile || !serverId) return;
     try {
       const data = { server_id: serverId, name: editingProfile.name, is_default: editingProfile.is_default, ranges };
       if (editingProfile.id) {
@@ -37,7 +77,9 @@ export default function TempProfiles() {
       setEditingProfile(null);
       setRanges(DEFAULT_RANGES);
       fetchProfiles();
-    } catch {}
+    } catch (err) {
+      console.error('Failed to save profile:', err);
+    }
   };
 
   const handleDelete = async (id: number) => {
@@ -45,15 +87,19 @@ export default function TempProfiles() {
     try {
       await api.deleteProfile(id);
       fetchProfiles();
-    } catch {}
+    } catch (err) {
+      console.error('Failed to delete profile:', err);
+    }
   };
 
-  if (!serverId) {
+  if (servers.length === 0) {
     return (
       <div className="container">
         <div className="card" style={{textAlign: 'center', padding: 40}}>
-          <h2 style={{fontSize: 18, marginBottom: 12}}>No Server Selected</h2>
-          <p style={{color: 'var(--text-secondary)'}}>Select a server from Inventory first, or navigate to <a href="/temp-profiles?server_id=1">/temp-profiles?server_id=1</a></p>
+          <h2 style={{fontSize: 18, marginBottom: 12}}>No Servers Available</h2>
+          <p style={{color: 'var(--text-secondary)'}}>
+            Add a server to Inventory first, then come back to manage temperature profiles.
+          </p>
         </div>
       </div>
     );
@@ -61,12 +107,46 @@ export default function TempProfiles() {
 
   return (
     <div>
-      <div className="toolbar">
-        <h2 style={{fontSize: 18}}>Temperature Profiles</h2>
-        <button className="btn btn-primary" onClick={() => { setEditingProfile({ id: 0, server_id: serverId, server_name: null, is_default: false, name: 'New Profile', ranges: [], created_at: null, updated_at: null } as TempProfile); setRanges(DEFAULT_RANGES); }}>
+      <div className="toolbar" style={{marginBottom: 16}}>
+        <h2 style={{fontSize: 18, margin: 0}}>Temperature Profiles</h2>
+        <div style={{flex: 1}} />
+        <label style={{color: 'var(--text-secondary)', fontSize: 13}}>Server:</label>
+        <select
+          value={serverId || ''}
+          onChange={handleServerChange}
+          style={{
+            padding: '4px 8px',
+            borderRadius: 4,
+            border: '1px solid var(--border)',
+            background: 'var(--bg-card)',
+            color: 'var(--text-primary)',
+          }}
+        >
+          {servers.map(s => (
+            <option key={s.id} value={s.id}>{s.name} ({s.ipmi_ip})</option>
+          ))}
+        </select>
+        <button
+          className="btn btn-primary"
+          onClick={() => {
+            setEditingProfile({
+              id: 0,
+              server_id: serverId!,
+              server_name: servers.find(s => s.id === serverId)?.name || '',
+              is_default: false,
+              name: 'New Profile',
+              ranges: [],
+              created_at: null,
+              updated_at: null,
+            } as TempProfile);
+            setRanges(DEFAULT_RANGES);
+          }}
+        >
           + New Profile
         </button>
       </div>
+
+      {loading && <p style={{color: 'var(--text-secondary)'}}>Loading profiles...</p>}
 
       {editingProfile ? (
         <div className="card">
@@ -121,8 +201,10 @@ export default function TempProfiles() {
               </div>
             </div>
           ))}
-          {profiles.length === 0 && (
-            <div className="empty-state" style={{gridColumn: '1 / -1'}}><p>No profiles yet</p></div>
+          {profiles.length === 0 && !loading && (
+            <div className="empty-state" style={{gridColumn: '1 / -1'}}>
+              <p>No profiles yet — click "+ New Profile" to create one.</p>
+            </div>
           )}
         </div>
       )}
