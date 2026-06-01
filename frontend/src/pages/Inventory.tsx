@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { Link } from 'react-router-dom';
 import { api } from '../api';
 import type { Server, ServerGroup } from '../types';
 
@@ -99,7 +100,12 @@ export default function Inventory() {
                 <td><span className={`badge ${s.status === 'online' ? 'badge-green' : s.status === 'degraded' ? 'badge-yellow' : 'badge-red'}`}>{s.status}</span></td>
                 <td style={{fontSize: 11}}>{s.last_seen ? new Date(s.last_seen).toLocaleString() : '—'}</td>
                 <td>
-                  <button className="btn btn-sm btn-danger" onClick={() => handleDelete(s.id)}>Remove</button>
+                  <div style={{display: 'flex', gap: 4}}>
+                    <Link to={`/temp-profiles?server_id=${s.id}`} className="btn btn-sm">Temps</Link>
+                    <Link to={`/server/${s.id}/fan-control`} className="btn btn-sm">Fans</Link>
+                    <Link to={`/server/${s.id}/settings`} className="btn btn-sm">Settings</Link>
+                    <button className="btn btn-sm btn-danger" onClick={() => handleDelete(s.id)}>Remove</button>
+                  </div>
                 </td>
               </tr>
             ))}

@@ -7,6 +7,7 @@ import Dashboard from './pages/Dashboard';
 import Inventory from './pages/Inventory';
 import Users from './pages/Users';
 import TempProfiles from './pages/TempProfiles';
+import FanControl from './pages/FanControl';
 import IdracSettings from './pages/IdracSettings';
 
 function RequireAuth({ children }: { children: JSX.Element }) {
@@ -100,6 +101,7 @@ export default function App() {
                   <Route path="/inventory" element={<Inventory />} />
                   <Route path="/users" element={<Users />} />
                   <Route path="/temp-profiles" element={<TempProfiles />} />
+                  <Route path="/server/:server_id/fan-control" element={<FanControl />} />
                   <Route path="/server/:server_id/settings" element={<IdracSettings />} />
                   <Route path="*" element={<Navigate to="/" replace />} />
                 </Routes>
