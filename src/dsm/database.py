@@ -2,13 +2,15 @@
 
 from collections.abc import AsyncGenerator
 
+from pathlib import Path
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from dsm.config import settings
 from dsm.models import Base
 
+_db_path = str(Path(settings.db_path).expanduser())
 engine = create_async_engine(
-    f"sqlite+aiosqlite:///{settings.db_path}",
+    f"sqlite+aiosqlite:///{_db_path}",
     echo=settings.debug,
 )
 

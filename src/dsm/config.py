@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     )
 
     # Database path — SQLite file location
-    db_path: str = "/var/lib/dsm/dsm.db"
+    db_path: str = "~/.dsm/dsm.db"
 
     # Web server
     host: str = "0.0.0.0"
@@ -72,8 +72,8 @@ class Settings(BaseSettings):
     @property
     def data_dir(self) -> Path:
         """Parent directory of the database file."""
-        db = Path(self.db_path)
-        return db.parent if db.parent != Path("/") else Path("/var/lib/dsm")
+        db = Path(self.db_path).expanduser()
+        return db.parent if db.parent != Path("/") else db.parent
 
     @property
     def data_dir_exists(self) -> bool:
