@@ -227,7 +227,7 @@ async def get_user(
     return _user_to_response(user, roles)
 
 
-@router.post("/", response_model=dict)
+@router.post("/", response_model=dict, status_code=201)
 async def create_user(
     data: UserCreate,
     _admin: User = Depends(require_admin),

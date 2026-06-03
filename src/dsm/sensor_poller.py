@@ -76,18 +76,23 @@ class SensorPoller:
             return {"status": "error", "error": "Cannot decrypt credentials"}
 
         async with async_session() as session:
+            # Re-fetch the server in this session so ORM updates are tracked
+            db_server = await session.get(Server, server.id)
+            if db_server is None:
+                return {"status": "error", "error": f"Server {server.id} not found"}
+
             try:
                 # Fetch all thermal + fan data from iDRAC
                 sensor_data = await connector.get_sensors()
 
                 # Update server status to online
-                server.status = ServerStatus.ONLINE.value
-                server.last_seen = datetime.now(timezone.utc)
+                db_server.status = ServerStatus.ONLINE.value
+                db_server.last_seen = datetime.now(timezone.utc)
 
                 if sensor_data.system_info:
-                    server.model = sensor_data.system_info.model or server.model
-                    server.serial = sensor_data.system_info.service_tag or server.serial
-                    server.drac_version = sensor_data.system_info.drac_version
+                    db_server.model = sensor_data.system_info.model or db_server.model
+                    db_server.serial = sensor_data.system_info.service_tag or db_server.serial
+                    db_server.drac_version = sensor_data.system_info.drac_version
 
                 # Store each temperature reading
                 for temp in sensor_data.temperatures:
@@ -103,9 +108,9 @@ class SensorPoller:
 
                 result = {
                     "status": "ok",
-                    "server": server.name,
-                    "server_id": server.id,
-                    "timestamp": server.last_seen.isoformat(),
+                    "server": db_server.name,
+                    "server_id": db_server.id,
+                    "timestamp": db_server.last_seen.isoformat(),
                     "temperatures": [
                         {"name": t.name, "value": t.value_celsius, "context": t.physical_context}
                         for t in sensor_data.temperatures
@@ -117,19 +122,19 @@ class SensorPoller:
                     "power_state": sensor_data.system_info.power_state if sensor_data.system_info else "Unknown",
                 }
 
-                logger.info(f"Polled {server.name}: {len(sensor_data.temperatures)} temps, {len(sensor_data.fans)} fans")
+                logger.info(f"Polled {db_server.name}: {len(sensor_data.temperatures)} temps, {len(sensor_data.fans)} fans")
                 return result
 
             except IdracError as e:
-                server.status = ServerStatus.DEGRADED.value
+                db_server.status = ServerStatus.DEGRADED.value
                 await session.commit()
-                logger.warning(f"Poll error for {server.name}: {e}")
-                return {"status": "error", "server": server.name, "error": str(e)}
+                logger.warning(f"Poll error for {db_server.name}: {e}")
+                return {"status": "error", "server": db_server.name, "error": str(e)}
             except Exception as e:
-                server.status = ServerStatus.OFFLINE.value
+                db_server.status = ServerStatus.OFFLINE.value
                 await session.commit()
-                logger.error(f"Unexpected error polling {server.name}: {e}")
-                return {"status": "error", "server": server.name, "error": str(e)}
+                logger.error(f"Unexpected error polling {db_server.name}: {e}")
+                return {"status": "error", "server": db_server.name, "error": str(e)}
 
     async def poll_all(self) -> list:
         """Poll all registered servers.

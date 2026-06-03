@@ -17,9 +17,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from dsm.auth import get_current_user, require_operator
 from dsm.crypto import decrypt_ciphertext, encrypt_plaintext
 from dsm.database import get_session
-from dsm.models import Server
+from dsm.models import Server, User
 
 router = APIRouter(prefix="/servers", tags=["servers"])
 
@@ -82,7 +83,10 @@ class PowerAction(BaseModel):
 
 
 @router.get("/", response_model=list[ServerResponse])
-async def list_servers(session: AsyncSession = Depends(get_session)):
+async def list_servers(
+    _user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
     """List all managed Dell servers."""
     result = await session.execute(select(Server).order_by(Server.name))
     servers = result.scalars().all()
@@ -90,7 +94,11 @@ async def list_servers(session: AsyncSession = Depends(get_session)):
 
 
 @router.post("/", response_model=ServerResponse, status_code=201)
-async def add_server(data: ServerCreate, session: AsyncSession = Depends(get_session)):
+async def add_server(
+    data: ServerCreate,
+    _user: User = Depends(require_operator),
+    session: AsyncSession = Depends(get_session),
+):
     """Add a new server to manage.
 
     The password is encrypted at rest using AES-256-CBC.
@@ -119,7 +127,11 @@ async def add_server(data: ServerCreate, session: AsyncSession = Depends(get_ses
 
 
 @router.get("/{server_id}", response_model=ServerResponse)
-async def get_server(server_id: int, session: AsyncSession = Depends(get_session)):
+async def get_server(
+    server_id: int,
+    _user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
     """Get details for a specific server by ID."""
     server = await session.get(Server, server_id)
     if not server:
@@ -128,7 +140,12 @@ async def get_server(server_id: int, session: AsyncSession = Depends(get_session
 
 
 @router.put("/{server_id}", response_model=ServerResponse)
-async def update_server(server_id: int, data: ServerUpdate, session: AsyncSession = Depends(get_session)):
+async def update_server(
+    server_id: int,
+    data: ServerUpdate,
+    _user: User = Depends(require_operator),
+    session: AsyncSession = Depends(get_session),
+):
     """Update server details. Only provided fields are changed."""
     server = await session.get(Server, server_id)
     if not server:
@@ -149,7 +166,11 @@ async def update_server(server_id: int, data: ServerUpdate, session: AsyncSessio
 
 
 @router.delete("/{server_id}", status_code=204)
-async def delete_server(server_id: int, session: AsyncSession = Depends(get_session)):
+async def delete_server(
+    server_id: int,
+    _user: User = Depends(require_operator),
+    session: AsyncSession = Depends(get_session),
+):
     """Remove a server and all its associated sensor data."""
     server = await session.get(Server, server_id)
     if not server:
@@ -159,7 +180,12 @@ async def delete_server(server_id: int, session: AsyncSession = Depends(get_sess
 
 
 @router.post("/{server_id}/power", response_model=dict)
-async def control_power(server_id: int, body: PowerAction, session: AsyncSession = Depends(get_session)):
+async def control_power(
+    server_id: int,
+    body: PowerAction,
+    _user: User = Depends(require_operator),
+    session: AsyncSession = Depends(get_session),
+):
     """Send power control command to server's iDRAC.
 
     Supported actions:

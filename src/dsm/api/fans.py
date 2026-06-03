@@ -1,17 +1,19 @@
 """Fan control endpoints."""
 
+from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from dsm.auth import get_current_user, require_operator
 from dsm.crypto import decrypt_ciphertext
 from dsm.database import get_session
 from dsm.fan_control import FanController
 from dsm.idrac_connector import IdracConnector, IdracConnectionError
-from dsm.models import FanConfig, Server, FanMode
+from dsm.models import FanConfig, FanMode, Server, User
 
 router = APIRouter(prefix="/fans", tags=["fans"])
 
@@ -36,10 +38,13 @@ class FanConfigResponse(BaseModel):
     disk_temp_max: float
     manual_speed: int
     auto_control: bool
-    updated_at: Optional[str]
+    updated_at: Optional[datetime] = None
 
-    class Config:
-        from_attributes = True
+    @field_serializer("updated_at")
+    def serialize_updated_at(self, value: datetime | None, _info) -> str | None:
+        return value.isoformat() if value else None
+
+    model_config = {"from_attributes": True}
 
 
 class FanControlAction(BaseModel):
@@ -48,7 +53,11 @@ class FanControlAction(BaseModel):
 
 
 @router.get("/{server_id}", response_model=FanConfigResponse)
-async def get_fan_config(server_id: int, session: AsyncSession = Depends(get_session)):
+async def get_fan_config(
+    server_id: int,
+    _user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
     """Get fan configuration for a server."""
     server = await session.get(Server, server_id)
     if not server:
@@ -81,6 +90,7 @@ async def get_fan_config(server_id: int, session: AsyncSession = Depends(get_ses
 async def update_fan_config(
     server_id: int,
     data: FanConfigCreate,
+    _user: User = Depends(require_operator),
     session: AsyncSession = Depends(get_session),
 ):
     """Update fan configuration for a server."""
@@ -122,6 +132,7 @@ async def update_fan_config(
 async def control_fans(
     server_id: int,
     action: FanControlAction,
+    _user: User = Depends(require_operator),
     session: AsyncSession = Depends(get_session),
 ):
     """Execute fan control actions."""
