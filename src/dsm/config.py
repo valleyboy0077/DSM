@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     port: int = 8000
     debug: bool = False
 
+    # HTTPS / TLS
+    ssl_cert: str = ""
+    ssl_key: str = ""
+    ssl_self_signed: bool = False
+
     # Sensor polling interval in seconds (default: 3 seconds for near-real-time monitoring)
     sensor_poll_interval: int = 3
 

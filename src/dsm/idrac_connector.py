@@ -169,12 +169,25 @@ class IdracConnector:
             oem = root.get("Oem", {}).get("Dell", {})
             service_tag = oem.get("ServiceTag", system.get("AssetTag", ""))
 
-            # Check if this is iDRAC7 or iDRAC8 by testing OEM endpoints
+            # Detect iDRAC generation more reliably:
+            # 1. Try Dell OEM endpoint (works on iDRAC8 with newer firmware)
+            # 2. Check firmware version from Manager (iDRAC7 = 2.x, iDRAC8 = 3.x+)
+            # 3. Check RedfishVersion (iDRAC7 = 1.0.0/1.0.2, iDRAC8 = 1.1.0+)
             try:
                 await self._request("/redfish/v1/Managers/iDRAC.Embedded.1/Oem/Dell/")
                 self._drac_version = "idrac8"
             except IdracError:
-                self._drac_version = "idrac7"
+                # Check Manager firmware version as fallback
+                try:
+                    manager = await self._request("/redfish/v1/Managers/iDRAC.Embedded.1/")
+                    fw = manager.get("FirmwareVersion", "")
+                    if fw.startswith("3.") or fw.startswith("4.") or fw.startswith("5.") or fw.startswith("6.") or fw.startswith("7."):
+                        self._drac_version = "idrac8"
+                    else:
+                        self._drac_version = "idrac7"
+                except IdracError:
+                    # Last resort: check RedfishVersion from root
+                    self._drac_version = "idrac8" if self._firmware_version not in ("1.0.0", "1.0.2", "unknown") else "idrac7"
 
             power_state = system.get("PowerState", "Unknown")
 

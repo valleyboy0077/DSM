@@ -4,6 +4,7 @@ Manages app lifecycle, registers all API routers, serves the React SPA,
 and seeds default data (roles, admin user) on startup.
 """
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -46,14 +47,43 @@ async def lifespan(app: FastAPI):
         await seed_default_roles(session)
         await seed_default_admin(session)
 
-    # Start background services
+    # Start sensor poller
     await poller.start()
+
+    # Start MCP server (for AI agent integration) if enabled
+    mcp_task = None
+    if settings.mcp_enabled:
+        try:
+            from uvicorn import Config, Server as UvicornServer
+            from dsm.mcp.server import mcp as mcp_server
+
+            # Use the SSE ASGI app from FastMCP
+            mcp_app = mcp_server.sse_app
+            mcp_config = Config(
+                app=mcp_app,
+                host="0.0.0.0",
+                port=settings.mcp_port,
+                log_level="warning",
+                lifespan="off",
+            )
+            mcp_uvicorn = UvicornServer(mcp_config)
+            mcp_task = asyncio.create_task(mcp_uvicorn.serve())
+            logger.info(f"MCP server started on port {settings.mcp_port}")
+        except Exception as exc:
+            logger.warning(f"MCP server failed to start (AI agent tools unavailable): {exc}")
+
     logger.info("DSM started - database initialized, roles seeded, sensor polling active")
 
     yield
 
     logger.info("DSM shutting down...")
     await poller.stop()
+    if mcp_task:
+        mcp_task.cancel()
+        try:
+            await mcp_task
+        except asyncio.CancelledError:
+            pass
     logger.info("DSM stopped")
 
 

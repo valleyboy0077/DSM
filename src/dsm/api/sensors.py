@@ -11,8 +11,9 @@ from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, HTTPExce
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from dsm.auth import get_current_user
 from dsm.database import get_session
-from dsm.models import SensorReading, Server
+from dsm.models import SensorReading, Server, User
 from dsm.sensor_poller import SensorPoller
 
 router = APIRouter(prefix="/sensors", tags=["sensors"])
@@ -26,6 +27,7 @@ async def get_sensors(
     server_id: int = None,
     sensor_type: str = None,
     hours: float = 1.0,
+    _user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
     """Get sensor readings with optional filters.
@@ -73,6 +75,7 @@ async def get_sensors(
 @router.get("/latest")
 async def get_latest_sensors(
     server_id: int = None,
+    _user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
     """Get the latest reading for each sensor label on a server.
@@ -124,7 +127,11 @@ async def get_latest_sensors(
 
 
 @router.get("/summary/{server_id}")
-async def get_sensor_summary(server_id: int, session: AsyncSession = Depends(get_session)):
+async def get_sensor_summary(
+    server_id: int,
+    _user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
     """Get current temperature summary for a server.
 
     Fetches the most recent readings (last 5 minutes) and returns
