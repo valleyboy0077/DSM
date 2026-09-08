@@ -81,7 +81,7 @@ class Command:
     assert await connector.set_fan_mode_ipmi("Manual", 25) is True
 
     events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
-    assert events[0] == {"event": "command", "privlevel": 2}
+    assert events[0] == {"event": "command", "privlevel": 4}
     assert events[1:3] == [
         {"event": "raw", "netfn": 0x30, "command": 0x30, "data": [0x01, 0x00]},
         {"event": "raw", "netfn": 0x30, "command": 0x30, "data": [0x02, 0xFF, 25]},
