@@ -226,6 +226,16 @@ class FanController:
             if success:
                 return True
 
+            if mode == "Manual":
+                # RACADM MinimumFanSpeed is a floor, not an exact duty command.
+                # Do not silently turn an operator's percentage into a different
+                # hardware setting when OEM IPMI is unavailable.
+                logger.error(
+                    "Exact iDRAC7 manual fan control unavailable for %s; refusing RACADM floor fallback",
+                    self.connector.ip,
+                )
+                return False
+
             logger.warning(
                 "IPMI iDRAC7 fan control failed for %s; trying racadm fallback",
                 self.connector.ip,

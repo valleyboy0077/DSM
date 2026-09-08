@@ -81,7 +81,7 @@ class Command:
     assert await connector.set_fan_mode_ipmi("Manual", 25) is True
 
     events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
-    assert events[0] == {"event": "command", "privlevel": 4}
+    assert events[0] == {"event": "command", "privlevel": 2}
     assert events[1:3] == [
         {"event": "raw", "netfn": 0x30, "command": 0x30, "data": [0x01, 0x00]},
         {"event": "raw", "netfn": 0x30, "command": 0x30, "data": [0x02, 0xFF, 25]},
@@ -101,15 +101,15 @@ async def test_idrac7_prefers_ipmi_backend_for_new_servers():
 
 
 @pytest.mark.asyncio
-async def test_idrac7_falls_back_to_racadm_when_ipmi_is_unauthorized():
+async def test_idrac7_refuses_inexact_racadm_fallback_when_ipmi_is_unauthorized():
     connector = FakeConnector(drac_version='idrac7', racadm_success=True, ipmi_success=False)
     controller = FanController(connector=connector, fan_min=7)
 
     ok = await controller.set_manual_speed(25)
 
-    assert ok is True
-    assert connector.calls == [('ipmi', 'Manual', 25), ('racadm', 'Manual', 25)]
-    assert getattr(connector, '_fan_control_backend', None) == 'racadm'
+    assert ok is False
+    assert connector.calls == [('ipmi', 'Manual', 25)]
+    assert getattr(connector, '_fan_control_backend', None) is None
 
 
 @pytest.mark.asyncio
