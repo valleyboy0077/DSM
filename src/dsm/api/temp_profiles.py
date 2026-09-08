@@ -18,21 +18,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/temp-profiles", tags=["temp-profiles"])
 
 
-async def get_active_temp_profile_ranges(session: AsyncSession, server_id: int) -> list[TempProfileRange]:
-    """Return the active/default thermal profile ranges for a server."""
-    profile_result = await session.execute(
-        select(TempProfile).where(TempProfile.server_id == server_id, TempProfile.is_default == True)
-    )
-    profile = cast(Any, profile_result.scalars().first())
-    if not profile:
-        return []
-
-    range_result = await session.execute(
-        select(TempProfileRange).where(TempProfileRange.profile_id == profile.id)
-    )
-    return list(range_result.scalars().all())
-
-
 class TempRangeCreate(BaseModel):
     component_type: str
     component_label: Optional[str] = None

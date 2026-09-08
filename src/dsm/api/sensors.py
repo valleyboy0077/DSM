@@ -13,9 +13,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dsm.auth import get_current_user
-from dsm.crypto import decrypt_ciphertext
 from dsm.database import get_session
-from dsm.idrac_connector import IdracConnector, IdracConnectionError, IdracError
+from dsm.api.idrac import execute_idrac_request
 from dsm.models import SensorReading, Server, User
 from dsm.sensor_poller import SensorPoller
 
@@ -190,21 +189,15 @@ async def get_live_sensors(
     if not server:
         raise HTTPException(status_code=404, detail="Server not found")
 
-    password = decrypt_ciphertext(server.ipmi_password_enc)
-    if not password:
-        raise HTTPException(status_code=500, detail="Cannot decrypt credentials")
-
-    connector = IdracConnector(
-        ip=server.ipmi_ip,
-        username=server.ipmi_user,
-        password=password,
-        drac_version=server.drac_version,
+    sensor_data = await execute_idrac_request(
+        server,
+        lambda connector: connector.get_sensors(),
+        credential_error_detail="Cannot decrypt credentials",
+        connection_error_detail=lambda error: f"Cannot connect to iDRAC: {error}",
+        idrac_error_detail=lambda error: f"iDRAC sensor query failed: {error}",
     )
-
-    try:
-        sensor_data = await connector.get_sensors()
-        system = sensor_data.system_info
-        return {
+    system = sensor_data.system_info
+    return {
             "server_id": server.id,
             "server_name": server.name,
             "collected_at": datetime.now(timezone.utc).isoformat(),
@@ -239,13 +232,7 @@ async def get_live_sensors(
                 }
                 for fan in sensor_data.fans
             ],
-        }
-    except IdracConnectionError as e:
-        raise HTTPException(status_code=502, detail=f"Cannot connect to iDRAC: {e}")
-    except IdracError as e:
-        raise HTTPException(status_code=502, detail=f"iDRAC sensor query failed: {e}")
-    finally:
-        await connector.close()
+    }
 
 
 @router.websocket("/ws/{server_id}")

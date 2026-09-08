@@ -259,16 +259,15 @@ async def test_run_cycle_does_not_treat_saved_manual_speed_as_live_pwm(monkeypat
         async def reset_to_default(self):
             return True
 
-    async def fake_close():
-        return None
-
     async def fake_get_active_temp_profile_ranges(session, server_id):
         return []
 
-    monkeypatch.setattr(fans_api, 'decrypt_ciphertext', lambda value: 'plaintext')
-    monkeypatch.setattr(fans_api, 'IdracConnector', lambda **kwargs: SimpleNamespace(close=fake_close))
+    async def fake_execute_idrac_request(server, operation, **kwargs):
+        return await operation(SimpleNamespace())
+
     monkeypatch.setattr(fans_api, 'FanController', FakeController)
     monkeypatch.setattr(fans_api, 'get_active_temp_profile_ranges', fake_get_active_temp_profile_ranges)
+    monkeypatch.setattr(fans_api, 'execute_idrac_request', fake_execute_idrac_request)
     monkeypatch.setattr(fans_api, 'poller', SimpleNamespace(_last_fan_control_target={}, _last_fan_control_at={}), raising=False)
 
     result = await fans_api.control_fans(
