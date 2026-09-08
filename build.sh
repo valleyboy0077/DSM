@@ -1,4 +1,5 @@
 #!/bin/bash
-cd /home/sarah/dsm-scaffold/frontend
-npx vite build 2>&1
-echo "BUILD_EXIT: $?"
+set -euo pipefail
+
+cd "$(dirname "$0")/frontend"
+npm run build

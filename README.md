@@ -82,12 +82,13 @@ export DSM_ENCRYPTION_KEY='a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4'
 # 3. Create data directory
 sudo mkdir -p /var/lib/dsm
 
-# 4. Start backend
-uvicorn dsm.app:app --host 0.0.0.0 --port 8080
-
-# 5. Build frontend (separate terminal)
+# 4. Install frontend dependencies (once)
 cd frontend
-npm install && npm run build
+npm install
+cd ..
+
+# 5. Start DSM (builds the Vite frontend before launching Uvicorn)
+./start.sh
 ```
 
 ## Database migrations
