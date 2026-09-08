@@ -264,7 +264,7 @@ class IdracConnector:
         except IdracConnectionError:
             # Fall back to WS-Man identification
             xml = self._wsman_identify()
-            response = await self._request_wsman(xml)
+            await self._request_wsman(xml)
             # Parse firmware from response
             self._drac_version = "idrac7"
             self._firmware_version = "2.x"  # parsed from response if needed

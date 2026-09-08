@@ -57,8 +57,8 @@ async def lifespan(app: FastAPI):
             from uvicorn import Config, Server as UvicornServer
             from dsm.mcp.server import mcp as mcp_server
 
-            # Use the SSE ASGI app from FastMCP
-            mcp_app = mcp_server.sse_app
+            # Expose FastMCP's streamable HTTP endpoint at /mcp.
+            mcp_app = mcp_server.streamable_http_app()
             mcp_config = Config(
                 app=mcp_app,
                 host="0.0.0.0",

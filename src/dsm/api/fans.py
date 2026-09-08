@@ -13,7 +13,7 @@ from dsm.database import get_session
 from dsm.fan_control import FanController
 from dsm.api.idrac import execute_idrac_request
 from dsm.idrac_connector import IdracConnector
-from dsm.models import FanConfig, FanMode, Server, User
+from dsm.models import FanConfig, FanMode, Server
 from dsm.temp_profile_repository import get_active_temp_profile_ranges
 
 router = APIRouter(prefix="/fans", tags=["fans"])

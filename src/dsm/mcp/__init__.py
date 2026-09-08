@@ -11,7 +11,7 @@ An AI agent (Claude, Codex, etc.) can connect via MCP to:
   - View system event logs
   - Manage iDRAC users
 
-Transport: SSE (Server-Sent Events) over HTTP — configured via DSM_MCP_PORT.
+Transport: streamable HTTP at `/mcp` — configured via DSM_MCP_PORT.
 Authentication: Bearer token (same JWT used by REST API).
 
 Usage (from an AI agent config):
@@ -19,7 +19,7 @@ Usage (from an AI agent config):
     "command": "python3",
     "args": ["-m", "dsm.mcp.server"],
     "env": {
-      "DSM_API_URL": "http://127.0.0.1:8080",
+      "DSM_API_URL": "http://127.0.0.1:8000",
       "DSM_API_TOKEN": "<jwt_token>"
     }
   }

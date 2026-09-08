@@ -34,7 +34,7 @@ A Linux package that gives you a single pane of glass to monitor and control mul
 
 | Layer       | Technology                           |
 |-------------|--------------------------------------|
-| Backend     | Python 3.13, FastAPI, aiohttp        |
+| Backend     | Python 3.11+, FastAPI, httpx         |
 | Database    | SQLAlchemy 2.x + aiosqlite (SQLite)  |
 | iDRAC       | Redfish REST + WS-Man SOAP + IPMI    |
 | Encryption  | AES-256-CBC for stored passwords     |
@@ -58,7 +58,6 @@ A Linux package that gives you a single pane of glass to monitor and control mul
 DSM's MCP integration is designed for agent-driven diagnostics and control.
 
 - **Primary MCP transport for Hermes:** `http://127.0.0.1:8101/mcp`
-- **Helper SSE endpoint:** `http://127.0.0.1:8101/sse`
 - **Live hardware telemetry:** MCP sensor tools prefer live iDRAC data from `GET /sensors/live/{server_id}` instead of stored sensor history
 - **Fan control:** manual fan changes go through `POST /fans/{server_id}/control`
 - **Historical data:** the sensor history API remains available for auditing and trends, but it is not the preferred source for agent reads
@@ -84,7 +83,7 @@ export DSM_ENCRYPTION_KEY='a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4'
 sudo mkdir -p /var/lib/dsm
 
 # 4. Start backend
-uvicorn dsm.app:app --host 0.0.0.0 --port 8100
+uvicorn dsm.app:app --host 0.0.0.0 --port 8000
 
 # 5. Build frontend (separate terminal)
 cd frontend
