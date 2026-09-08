@@ -51,6 +51,10 @@ class FanSensor:
     rpm: int
     member_id: str
     percent: Optional[int] = None
+    # ``pwm`` is a controller-reported duty cycle.  ``controller_percentage``
+    # is another percentage supplied by the controller.  RPM estimates must
+    # never be used as an input to the automatic duty controller.
+    percent_source: str = "pwm"
     health: str = "OK"
 
 
@@ -295,15 +299,17 @@ class IdracConnector:
 
             # Parse fans
             for fan in thermal.get("Fans", []):
-                percent = (
-                    self._coerce_int(fan.get("Oem", {}).get("Dell", {}).get("PWM"))
-                    or self._coerce_int(fan.get("PercentAvailable"))
-                )
+                percent = self._coerce_int(fan.get("Oem", {}).get("Dell", {}).get("PWM"))
+                percent_source = "pwm"
+                if percent is None:
+                    percent = self._coerce_int(fan.get("PercentAvailable"))
+                    percent_source = "controller_percentage" if percent is not None else "unavailable"
                 fan_sensor = FanSensor(
                     name=fan.get("Name", "Unknown"),
                     rpm=fan.get("Reading", 0),
                     member_id=fan.get("MemberId", ""),
                     percent=percent,
+                    percent_source=percent_source,
                     health=fan.get("Status", {}).get("Health", "Unknown"),
                 )
                 data.fans.append(fan_sensor)
@@ -328,11 +334,13 @@ class IdracConnector:
             fan_rows = await self._wsman_enumerate("DCIM_FanView")
             parsed = []
             for row in fan_rows:
+                percent = self._coerce_int(row.get("PWM"))
                 parsed.append({
                     "name": row.get("DeviceDescription") or row.get("FQDD") or row.get("InstanceID") or "Fan",
                     "member_id": row.get("FQDD") or row.get("InstanceID") or "",
                     "rpm": self._coerce_int(row.get("CurrentReading")) or 0,
-                    "percent": self._coerce_int(row.get("PWM")),
+                    "percent": percent,
+                    "percent_source": "pwm" if percent is not None else "unavailable",
                     "health": self._status_label(row.get("PrimaryStatus")),
                     "source": "wsman",
                 })
@@ -346,19 +354,22 @@ class IdracConnector:
         parsed = []
         for fan in thermal.get("Fans", []):
             reading = self._coerce_int(fan.get("Reading")) or 0
-            percent = (
-                self._coerce_int(fan.get("Oem", {}).get("Dell", {}).get("PWM"))
-                or self._coerce_int(fan.get("PercentAvailable"))
-            )
+            percent = self._coerce_int(fan.get("Oem", {}).get("Dell", {}).get("PWM"))
+            percent_source = "pwm"
+            if percent is None:
+                percent = self._coerce_int(fan.get("PercentAvailable"))
+                percent_source = "controller_percentage" if percent is not None else "unavailable"
             if percent is None:
                 upper = self._coerce_int(fan.get("UpperThresholdCritical")) or self._coerce_int(fan.get("MaxReadingRange"))
                 if upper and upper > 0 and reading > 0:
                     percent = max(1, min(100, round((reading / upper) * 100)))
+                    percent_source = "rpm_estimate"
             parsed.append({
                 "name": fan.get("FanName") or fan.get("Name") or "Fan",
                 "member_id": fan.get("MemberId") or fan.get("Id") or "",
                 "rpm": reading,
                 "percent": percent,
+                "percent_source": percent_source,
                 "health": fan.get("Status", {}).get("Health", "Unknown"),
                 "source": "redfish",
             })

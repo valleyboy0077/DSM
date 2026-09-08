@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 from dsm.api import fans as fans_api
 from dsm.fan_control import FanController
-from dsm.idrac_connector import TempSensor, FanSensor
+from dsm.idrac_connector import FanSensor, IdracConnector, IdracError, TempSensor
 
 
 class FakeConnector:
@@ -57,6 +57,28 @@ async def test_idrac7_falls_back_to_racadm_when_ipmi_is_unauthorized():
 
 
 @pytest.mark.asyncio
+async def test_manual_override_preserves_requested_dell_duty_percent_on_idrac8():
+    connector = FakeConnector(drac_version='idrac8')
+    controller = FanController(connector=connector, fan_min=7)
+
+    ok = await controller.set_manual_speed(37)
+
+    assert ok is True
+    assert connector.calls == [('redfish', 'Manual', 37)]
+
+
+@pytest.mark.asyncio
+async def test_manual_override_does_not_translate_a_valid_low_dell_duty_to_auto_floor():
+    connector = FakeConnector(drac_version='idrac7')
+    controller = FanController(connector=connector, fan_min=7)
+
+    ok = await controller.set_manual_speed(1)
+
+    assert ok is True
+    assert connector.calls == [('ipmi', 'Manual', 1)]
+
+
+@pytest.mark.asyncio
 async def test_idrac7_unchanged_auto_cycle_refreshes_manual_target():
     connector = FakeConnector(drac_version='idrac7')
     controller = FanController(
@@ -90,7 +112,48 @@ async def test_idrac7_unchanged_auto_cycle_refreshes_manual_target():
 
 
 @pytest.mark.asyncio
-async def test_incremental_fan_logic_decreases_when_cpu_is_below_min_even_if_other_sensors_are_in_range():
+async def test_direct_auto_cycle_with_no_pwm_or_prior_target_does_not_command_fans():
+    connector = FakeConnector(drac_version='idrac7')
+    controller = FanController(connector=connector, fan_min=7)
+    sensor_data = SimpleNamespace(
+        temperatures=[TempSensor(name='CPU1 Temp', value_celsius=39.0, physical_context='CPU')],
+        fans=[FanSensor(name='Fan 1', rpm=6000, member_id='Fan1', percent=50, percent_source='rpm_estimate')],
+    )
+
+    result = await controller.control_cycle(sensor_data=sensor_data)
+
+    assert result.action_taken == 'no_action'
+    assert 'No controller-reported fan duty' in result.reason
+    assert connector.calls == []
+
+
+@pytest.mark.asyncio
+async def test_redfish_rpm_percentage_estimate_is_explicitly_marked_in_telemetry_payload(monkeypatch):
+    connector = IdracConnector(ip='10.0.0.1', username='user', password='password')
+
+    async def no_wsman_inventory(_class_name):
+        raise IdracError('WS-Man unavailable')
+
+    async def redfish_thermal(_path):
+        return {
+            'Fans': [{
+                'Name': 'Fan 1', 'MemberId': 'Fan1', 'Reading': 6000,
+                'MaxReadingRange': 12000, 'Status': {'Health': 'OK'},
+            }],
+        }
+
+    monkeypatch.setattr(connector, '_wsman_enumerate', no_wsman_inventory)
+    monkeypatch.setattr(connector, '_request', redfish_thermal)
+
+    fans = await connector.get_fan_inventory()
+    payload = fans_api.FanTelemetryItem(**fans[0]).model_dump()
+
+    assert payload['percent'] == 50
+    assert payload['percent_source'] == 'rpm_estimate'
+
+
+@pytest.mark.asyncio
+async def test_incremental_fan_logic_holds_when_mixed_sensors_are_cool_and_in_range():
     connector = FakeConnector()
     controller = FanController(
         connector=connector,  # type: ignore[arg-type]
@@ -117,14 +180,14 @@ async def test_incremental_fan_logic_decreases_when_cpu_is_below_min_even_if_oth
         step_percent=3,
     )
 
-    assert result.action_taken == 'decreased'
-    assert result.target_fan_percent == 19
-    assert 'decreasing fan' in result.reason
-    assert connector.calls == [('redfish', 'Manual', 19)]
+    assert result.action_taken == 'unchanged'
+    assert result.target_fan_percent == 22
+    assert 'within its configured range' in result.reason
+    assert connector.calls == []
 
 
 @pytest.mark.asyncio
-async def test_run_cycle_uses_saved_manual_speed_when_no_cached_target(monkeypatch):
+async def test_run_cycle_does_not_treat_saved_manual_speed_as_live_pwm(monkeypatch):
     fake_server = SimpleNamespace(
         id=1,
         ipmi_ip='10.1.1.109',
@@ -217,4 +280,4 @@ async def test_run_cycle_uses_saved_manual_speed_when_no_cached_target(monkeypat
 
     assert result is not None
     assert result['fan_percent'] == 7
-    assert created and created[0].calls == [9]
+    assert created and created[0].calls == [None]

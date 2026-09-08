@@ -59,7 +59,7 @@ async def test_auto_control_ramps_down_across_cycles_even_when_live_pwm_is_stale
     sensor_data = types.SimpleNamespace(
         temperatures=[
             TempSensor(name="CPU1 Temp", value_celsius=29.0, physical_context="CPU"),
-            TempSensor(name="Disk Bay 1", value_celsius=38.0, physical_context="Drive"),
+            TempSensor(name="Disk Bay 1", value_celsius=28.0, physical_context="Drive"),
             TempSensor(name="Inlet", value_celsius=40.0, physical_context="SystemBoard"),
         ],
         fans=[FanSensor(name="Fan 1", rpm=6000, member_id="Fan1", percent=22, health="OK")],

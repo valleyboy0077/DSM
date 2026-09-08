@@ -118,6 +118,7 @@ class FanTelemetryItem(BaseModel):
     member_id: str
     rpm: int
     percent: Optional[int] = None
+    percent_source: str
     health: str
     source: str
 
@@ -309,16 +310,16 @@ async def control_fans(
             if not success:
                 raise HTTPException(status_code=500, detail="Failed to set manual fan speed")
             from dsm.api.sensors import poller as sensor_poller
-            sensor_poller._last_fan_control_target.pop(server_id, None)
+            sensor_poller._last_fan_control_target[server_id] = controller._current_fan_percent
             sensor_poller._last_fan_control_at.pop(server_id, None)
             await _persist_fan_mode(
                 session,
                 config,
                 mode=FanMode.MANUAL.value,
                 auto_control=False,
-                manual_speed=action.speed,
+                manual_speed=controller._current_fan_percent,
             )
-            return {"status": "ok", "message": f"Fan speed set to {action.speed}%"}
+            return {"status": "ok", "message": f"Fan speed set to {controller._current_fan_percent}%"}
 
         elif action.action == "set_auto":
             success = await controller.set_auto_mode()
@@ -354,10 +355,10 @@ async def control_fans(
             from dsm.api.sensors import poller as sensor_poller
             current_fan_percent = sensor_poller._last_fan_control_target.get(server_id)
             if current_fan_percent is None:
-                # Fall back to the persisted manual target (or the server's saved
-                # manual speed) so a fresh control-cycle request still knows the
-                # last commanded fan percentage when telemetry only exposes RPM.
-                current_fan_percent = cast(int, config.manual_speed)
+                # Do not treat the saved manual setting as live PWM.  It may
+                # describe an old override, and using it could reduce a fan
+                # whose telemetry does not expose a duty percentage.
+                current_fan_percent = None
             result = await controller.control_cycle(
                 current_fan_percent=current_fan_percent,
                 profile_ranges=profile_ranges,

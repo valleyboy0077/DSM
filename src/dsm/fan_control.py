@@ -7,23 +7,13 @@ version-appropriate control path.
 
 import logging
 import re
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from typing import Optional
 
-from dsm.config import settings
 from dsm.idrac_connector import IdracConnector, IdracError, TempSensor, FanSensor
 from dsm.models import FanMode
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class PIDState:
-    """Persistent state for PID controller."""
-    integral: float = 0.0
-    previous_error: float = 0.0
-    last_update: Optional[datetime] = None
 
 
 @dataclass
@@ -73,13 +63,7 @@ class FanController:
         self.fan_min = fan_min
         self.fan_max = fan_max
 
-        # PID parameters
-        self.kp = settings.pid_proportional
-        self.ki = settings.pid_integral
-        self.kd = settings.pid_derivative
-
         # State
-        self._pid = PIDState()
         self._current_fan_percent: int = fan_min
         self._mode: str = FanMode.AUTO.value
 
@@ -106,117 +90,6 @@ class FanController:
                 result[category].append(sensor)
 
         return result
-
-    def _calculate_target_temp(self, categorized: dict) -> float:
-        """Calculate the effective target temperature for the PID.
-
-        Returns the most critical temperature that needs cooling.
-        """
-        critical_temps = []
-
-        # CPU temps - target the midpoint of the range
-        for sensor in categorized.get("cpu", []):
-            if sensor.value_celsius > self.cpu_temp_max:
-                # Above max - need to cool down urgently
-                critical_temps.append(sensor.value_celsius - self.cpu_temp_max)
-            elif sensor.value_celsius > self.cpu_temp_min:
-                # In range - no action needed for this sensor
-                pass
-
-        # Disk temps
-        for sensor in categorized.get("disk", []):
-            if sensor.value_celsius > self.disk_temp_max:
-                critical_temps.append(sensor.value_celsius - self.disk_temp_max)
-            elif sensor.value_celsius < self.disk_temp_min:
-                # Below min - fans might be too high
-                critical_temps.append(-(self.disk_temp_min - sensor.value_celsius))
-
-        # If nothing critical, return 0 (target met)
-        if not critical_temps:
-            return 0.0
-
-        # Return the worst deviation
-        return max(critical_temps)
-
-    def _pid_step(self, error: float, dt: float) -> int:
-        """Single PID control step. Returns fan speed percentage."""
-        # Clamp dt to avoid huge jumps
-        dt = min(dt, 60.0)
-
-        # Proportional
-        p = self.kp * error
-
-        # Integral - with anti-windup
-        self._pid.integral += error * dt
-        # Anti-windup: clamp integral term
-        self._pid.integral = max(-100, min(100, self._pid.integral))
-        i = self.ki * self._pid.integral
-
-        # Derivative
-        derivative = (error - self._pid.previous_error) / max(dt, 0.1)
-        d = self.kd * derivative
-
-        # Combine
-        output = p + i + d
-
-        # Convert to fan percentage adjustment
-        new_fan = self._current_fan_percent + int(output * 10)
-
-        # Clamp to valid range
-        new_fan = max(self.fan_min, min(self.fan_max, new_fan))
-
-        # Update state
-        self._pid.previous_error = error
-        self._pid.last_update = datetime.now(timezone.utc)
-
-        return new_fan
-
-    def _simple_fan_logic(self, categorized: dict) -> tuple:
-        """Simple rule-based fan control fallback.
-
-        Returns (fan_percent, reason).
-        """
-        cpu_temps = [s.value_celsius for s in categorized.get("cpu", [])]
-        disk_temps = [s.value_celsius for s in categorized.get("disk", [])]
-
-        max_cpu = max(cpu_temps) if cpu_temps else 0
-        max_disk = max(disk_temps) if disk_temps else 0
-
-        # Start with base speed
-        fan_percent = self.fan_min
-        reason_parts = []
-
-        # CPU cooling logic - scale from min to max range
-        if cpu_temps:
-            if max_cpu >= self.cpu_temp_max:
-                # Above max - ramp up linearly from 50% to 100%
-                overshoot = max_cpu - self.cpu_temp_max
-                cpu_fan = min(100, 50 + int(overshoot * 5))
-                fan_percent = max(fan_percent, cpu_fan)
-                reason_parts.append(f"CPU {max_cpu:.1f}°C > {self.cpu_temp_max}°C max")
-            elif max_cpu > self.cpu_temp_min:
-                # In range - maintain moderate speed
-                fan_percent = max(fan_percent, 30)
-                reason_parts.append(f"CPU {max_cpu:.1f}°C in range")
-            else:
-                # Below min - can reduce
-                reason_parts.append(f"CPU {max_cpu:.1f}°C < {self.cpu_temp_min}°C min")
-
-        # Disk cooling logic
-        if disk_temps:
-            if max_disk >= self.disk_temp_max:
-                overshoot = max_disk - self.disk_temp_max
-                disk_fan = min(75, 40 + int(overshoot * 10))
-                fan_percent = max(fan_percent, disk_fan)
-                reason_parts.append(f"Disk {max_disk:.1f}°C > {self.disk_temp_max}°C max")
-            elif max_disk < self.disk_temp_min:
-                # Disk too cold - fans might be excessive
-                reason_parts.append(f"Disk {max_disk:.1f}°C < {self.disk_temp_min}°C min")
-
-        if not reason_parts:
-            reason_parts.append("No sensors in range - using minimum speed")
-
-        return fan_percent, "; ".join(reason_parts)
 
     @staticmethod
     def _normalize_text(value: Optional[str]) -> str:
@@ -282,47 +155,54 @@ class FanController:
     ) -> tuple[int, str]:
         """Small-step thermal policy: move fans up or down by a few percent.
 
-        Increase when any monitored sensor is above its max threshold.
-        Decrease only when all monitored sensors are below their minimums.
-        Otherwise hold steady.
+        Increase when any CPU or drive sensor is above its max threshold.
+        Decrease only when every available CPU/drive sensor is below its own
+        minimum threshold.  Sensors in the configured band deliberately hold
+        the current target: a cool CPU must never reduce airflow for an
+        in-range disk (or vice versa).  Ambient telemetry is reported but has
+        no configured control band, so it does not independently change duty.
         """
         step_percent = max(1, min(10, step_percent))
         current_fan_percent = max(self.fan_min, min(self.fan_max, current_fan_percent))
 
         hot_sensors = []
         cool_sensors = []
-        in_range_sensors = []
+        monitored_sensors = []
 
-        for category in ("cpu", "disk", "ambient"):
+        for category in ("cpu", "disk"):
             for sensor in categorized.get(category, []):
+                monitored_sensors.append(sensor)
                 min_temp, max_temp = self._thresholds_for_sensor(sensor, profile_ranges)
                 temp = sensor.value_celsius
                 if temp > max_temp:
                     hot_sensors.append((sensor.name, temp, max_temp))
                 elif temp < min_temp:
                     cool_sensors.append((sensor.name, temp, min_temp))
-                else:
-                    in_range_sensors.append((sensor.name, temp, min_temp, max_temp))
 
         if hot_sensors:
             target = min(self.fan_max, current_fan_percent + step_percent)
             hottest = max(hot_sensors, key=lambda item: item[1])
             return target, f"{hottest[0]} {hottest[1]:.1f}°C > {hottest[2]:.1f}°C max; increasing fan by {step_percent}%"
 
-        if cool_sensors:
+        if monitored_sensors and len(cool_sensors) == len(monitored_sensors):
             target = max(self.fan_min, current_fan_percent - step_percent)
             coolest = min(cool_sensors, key=lambda item: item[1])
             return target, f"{coolest[0]} {coolest[1]:.1f}°C < {coolest[2]:.1f}°C min; decreasing fan by {step_percent}%"
 
-        return current_fan_percent, "Temperatures within configured range; holding fan speed"
+        if not monitored_sensors:
+            return current_fan_percent, "No CPU or drive temperatures available; holding fan speed"
+        return current_fan_percent, "At least one temperature is within its configured range; holding fan speed"
 
-    def _derive_current_fan_percent(self, fans: list, fallback: Optional[int] = None) -> int:
-        percents = [fan.percent for fan in fans if getattr(fan, "percent", None) is not None]
+    def _derive_current_fan_percent(self, fans: list) -> Optional[int]:
+        """Return only a controller-reported duty, never an RPM estimate."""
+        percents = [
+            fan.percent for fan in fans
+            if getattr(fan, "percent", None) is not None
+            and getattr(fan, "percent_source", "pwm") != "rpm_estimate"
+        ]
         if percents:
             return int(max(percents))
-        if fallback is not None:
-            return fallback
-        return self._current_fan_percent
+        return None
 
     async def _apply_fan_mode(self, mode: str, speed_percent: Optional[int] = None) -> bool:
         """Apply fan mode using the correct iDRAC API for this server."""
@@ -391,10 +271,16 @@ class FanController:
         disk_temp = max(disk_temps) if disk_temps else None
         ambient_temp = max(ambient_temps) if ambient_temps else 0
 
-        live_fan_percent = current_fan_percent if current_fan_percent is not None else self._derive_current_fan_percent(
-            sensor_data.fans,
-            self._current_fan_percent,
-        )
+        live_fan_percent = current_fan_percent if current_fan_percent is not None else self._derive_current_fan_percent(sensor_data.fans)
+        if live_fan_percent is None:
+            return FanControlResult(
+                target_fan_percent=self._current_fan_percent,
+                cpu_temp=cpu_temp,
+                disk_temp=disk_temp,
+                ambient_temp=ambient_temp,
+                action_taken="no_action",
+                reason="No controller-reported fan duty or prior DSM target; skipping automatic command",
+            )
         self._current_fan_percent = live_fan_percent
 
         target_fan, reason = self._incremental_fan_logic(
@@ -454,19 +340,21 @@ class FanController:
         return result
 
     async def set_manual_speed(self, speed: int) -> bool:
-        """Set fan to manual mode with specific speed."""
+        """Set an explicit Dell manual duty percentage (1--100)."""
         self._mode = FanMode.MANUAL.value
-        self._current_fan_percent = max(self.fan_min, min(self.fan_max, speed))
+        # The automatic-policy floor is not a translation rule for an
+        # operator's manual Dell duty command.  Keep the requested byte in the
+        # 1--100 range so iDRAC7 OEM IPMI and iDRAC8 Redfish receive the same
+        # percentage the operator selected.
+        self._current_fan_percent = max(1, min(100, int(speed)))
         return await self._apply_fan_mode("Manual", self._current_fan_percent)
 
     async def set_auto_mode(self) -> bool:
         """Switch to automatic DSM-managed fan control mode."""
         self._mode = FanMode.AUTO.value
-        self._pid = PIDState()  # Reset PID state
         return await self._apply_fan_mode("Auto")
 
     async def reset_to_default(self) -> bool:
         """Reset to iDRAC default thermal policy."""
         self._mode = FanMode.PROFILE.value
-        self._pid = PIDState()
         return await self._apply_fan_mode("Profile")

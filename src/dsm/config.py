@@ -63,13 +63,6 @@ class Settings(BaseSettings):
     drac_default_user: str = "root"
     drac_webui_port: int = 443
 
-    # PID controller tuning parameters for fan control
-    pid_proportional: float = 0.5
-    pid_integral: float = 0.1
-    pid_derivative: float = 0.01
-    pid_fan_min: int = 20   # Minimum fan speed percentage
-    pid_fan_max: int = 100  # Maximum fan speed percentage
-
     # MCP server settings
     mcp_enabled: bool = True
     mcp_port: int = 8101

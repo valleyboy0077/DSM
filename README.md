@@ -19,7 +19,7 @@ A Linux package that gives you a single pane of glass to monitor and control mul
 │                                                    │
 │  ┌──────────┐  ┌─────────────┐  ┌────────────┐   │
 │  │ MCP Server│  │ SensorPoller│  │ FanControl │   │
-│  │ (AI API)  │  │  (3s loop)  │  │  (PID)     │   │
+│  │ (AI API)  │  │  (3s loop)  │  │ (stepped)  │   │
 │  └──────────┘  └─────────────┘  └────────────┘   │
 │                                                    │
 │  ┌─────────────┐ ┌──────────────┐                  │
@@ -49,8 +49,6 @@ A Linux package that gives you a single pane of glass to monitor and control mul
 | Poll interval        | 3 seconds   | `DSM_SENSOR_POLL_INTERVAL`       |
 | CPU temp range       | 45–70 °C   | `default_cpu_temp_min/max`       |
 | Disk temp range      | 32–45 °C   | `default_disk_temp_min/max`      |
-| Min fan speed        | 20%        | `pid_fan_min`                    |
-| Max fan speed        | 100%       | `pid_fan_max`                    |
 | Backend port         | 8000       | `DSM_PORT`                       |
 | MCP server port      | 8101       | `DSM_MCP_PORT`                   |
 | Encryption key       | (change!)  | `DSM_ENCRYPTION_KEY`             |
