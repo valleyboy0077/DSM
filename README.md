@@ -90,6 +90,20 @@ cd frontend
 npm install && npm run build
 ```
 
+## Database migrations
+
+DSM upgrades its SQLite schema automatically during application startup. To run
+the same safe, idempotent upgrade before a deployment, stop DSM and run:
+
+```bash
+python -m dsm.migrations
+```
+
+The command uses `DSM_DB_PATH` (or its normal default), records each completed
+migration in `schema_migrations`, and refuses to start if the recorded history
+or required schema is inconsistent. Migrations are additive; take a normal
+SQLite backup before any production deployment.
+
 ## Directory Structure
 
 - `src/dsm/` — Python backend package
