@@ -25,7 +25,12 @@ async def _get_connector(server_id: int, session: AsyncSession) -> IdracConnecto
     password = decrypt_ciphertext(server.ipmi_password_enc)
     if not password:
         raise HTTPException(status_code=500, detail="Cannot decrypt server credentials")
-    return IdracConnector(ip=server.ipmi_ip, username=server.ipmi_user, password=password)
+    return IdracConnector(
+        ip=server.ipmi_ip,
+        username=server.ipmi_user,
+        password=password,
+        drac_version=server.drac_version,
+    )
 
 
 # ─── Network ─────────────────────────────────────────────────────────────────

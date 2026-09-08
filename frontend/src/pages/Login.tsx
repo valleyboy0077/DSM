@@ -20,38 +20,36 @@ export default function LoginPage() {
       navigate('/');
     } catch (err: any) {
       setError(err.message || 'Login failed');
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   return (
     <div className="login-container">
       <div className="login-card">
-        <h1><span className="logo">⬡</span> Dell Server Manager</h1>
+        <div className="login-logo">DSM</div>
+        <h1>Dell Server Manager</h1>
+        <p className="login-subtitle">iDRAC infrastructure control plane</p>
         <form onSubmit={handleSubmit}>
           {error && <div className="login-error">{error}</div>}
           <div className="form-group">
             <label>Username</label>
-            <input value={username} onChange={e => setUsername(e.target.value)} placeholder="admin" required autoFocus />
+            <input value={username} onChange={e => setUsername(e.target.value)} placeholder="DSM username" required autoFocus />
           </div>
           <div className="form-group">
             <label>Password</label>
             <input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••" required />
           </div>
-          <button type="submit" className="btn btn-primary" style={{width: '100%', justifyContent: 'center'}} disabled={loading}>
-            {loading ? 'Signing in...' : 'Sign In'}
+          <button type="submit" className="btn btn-primary btn-block" disabled={loading}>
+            {loading ? 'Signing in…' : 'Sign in'}
           </button>
         </form>
-        <div style={{marginTop: 20, textAlign: 'center', fontSize: 12, color: 'var(--text-secondary)'}}>
-          <div style={{marginBottom: 8}}>Theme preview:</div>
-          <div className="theme-selector" style={{justifyContent: 'center'}}>
+        <div style={{ marginTop: 22, textAlign: 'center', fontSize: 12, color: 'var(--text-secondary)' }}>
+          <div style={{ marginBottom: 9 }}>Preview theme</div>
+          <div className="theme-selector" style={{ justifyContent: 'center' }}>
             {THEMES.map(t => (
-              <div key={t.id}
-                className="theme-dot"
-                style={{backgroundColor: t.color}}
-                title={t.label}
-                onClick={() => document.documentElement.setAttribute('data-theme', t.id)}
-              />
+              <button key={t.id} type="button" className="theme-dot" style={{ backgroundColor: t.color }} title={t.label} onClick={() => document.documentElement.setAttribute('data-theme', t.id)} />
             ))}
           </div>
         </div>

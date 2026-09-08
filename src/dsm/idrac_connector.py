@@ -1,16 +1,28 @@
-"""iDRAC connector — dual protocol support (Redfish REST + WS-Man SOAP).
+"""iDRAC connector — Dell controller access via Redfish, WS-Man, IPMI, and racadm.
 
-Handles authentication, sensor reading, fan control, and power operations
-for both iDRAC7 (WS-Man primary) and iDRAC8 (Redfish primary).
+Handles authentication, sensor reading, fan control, and power operations.
+The internal `drac_version` flag is best understood as a DSM compatibility /
+control-routing profile, not always a perfect user-facing hardware-generation
+label.
 """
 
+import asyncio
 import logging
+import shutil
 import ssl
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
 import httpx
+
+try:
+    from pyghmi.ipmi import command as pyghmi_command
+except Exception:  # pragma: no cover - optional dependency at runtime
+    pyghmi_command = None
 
 logger = logging.getLogger(__name__)
 
@@ -38,17 +50,23 @@ class FanSensor:
     name: str
     rpm: int
     member_id: str
+    percent: Optional[int] = None
     health: str = "OK"
 
 
 @dataclass
 class SystemInfo:
-    """System identification info."""
+    """System identification info.
+
+    `drac_version` is the internally stored DSM control profile used by backend
+    routing. UI code should prefer the server API's `controller_label` when it
+    needs a user-facing hardware/controller generation label.
+    """
     model: str
     service_tag: str
     bios_version: str
     firmware_version: str  # iDRAC firmware
-    drac_version: str  # "idrac7" or "idrac8"
+    drac_version: str  # DSM compatibility/control profile: "idrac7" or "idrac8"
     power_state: str = "Unknown"
 
 
@@ -63,17 +81,20 @@ class IdracSensorData:
 class IdracConnector:
     """Connect to and manage a Dell iDRAC instance.
 
-    Supports both iDRAC7 (WS-Man/SOAP, limited Redfish) and iDRAC8 (full Redfish).
-    Auto-detects protocol support on first connection.
+    Supports Dell controller access across multiple generations/protocols.
+    Auto-detects protocol support on first connection, but callers can seed a
+    stored DSM control-profile hint when the inventory already knows which
+    backend path should be preferred.
     """
 
-    def __init__(self, ip: str, username: str, password: str):
+    def __init__(self, ip: str, username: str, password: str, drac_version: Optional[str] = None):
         self.ip = ip
         self.username = username
         self.password = password
         self.base_url = f"https://{ip}"
-        self._drac_version: Optional[str] = None
+        self._drac_version: Optional[str] = drac_version
         self._firmware_version: Optional[str] = None
+        self._fan_control_backend: Optional[str] = None
         self._client: Optional[httpx.AsyncClient] = None
         self._ssl_context = self._make_ssl_context()
 
@@ -99,6 +120,37 @@ class IdracConnector:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
             self._client = None
+
+    def set_control_profile_hint(self, drac_version: Optional[str]) -> None:
+        """Seed/update the stored DSM control-profile hint for routing decisions."""
+        if drac_version:
+            self._drac_version = drac_version
+
+    @staticmethod
+    def _odata_path(item) -> str:
+        """Normalize Redfish collection members to an @odata path string."""
+        if isinstance(item, dict):
+            return item.get("@odata.id", "")
+        if isinstance(item, str):
+            return item
+        return ""
+
+    async def _request_many(self, items) -> list[dict]:
+        """Fetch multiple Redfish objects concurrently, skipping failures."""
+        async def fetch_one(item) -> Optional[dict]:
+            path = self._odata_path(item)
+            if not path:
+                return None
+            try:
+                return await self._request(path)
+            except IdracError:
+                return None
+
+        return [
+            result
+            for result in await asyncio.gather(*(fetch_one(item) for item in items))
+            if result is not None
+        ]
 
     async def _request(self, path: str, method: str = "GET", json_body=None) -> dict:
         """Make an authenticated Redfish request."""
@@ -156,7 +208,13 @@ class IdracConnector:
             raise IdracConnectionError(f"WS-Man connection to {self.ip} failed: {e}")
 
     async def detect_version(self) -> SystemInfo:
-        """Auto-detect iDRAC version and return system info."""
+        """Detect the DSM control profile and return system info.
+
+        The returned `drac_version` remains the backend compatibility label used
+        for control-path selection. It may differ from the exact user-facing
+        controller generation shown in the UI, which should come from model-based
+        metadata shaping in the servers API.
+        """
         # Try Redfish first
         try:
             root = await self._request("/redfish/v1/")
@@ -237,10 +295,15 @@ class IdracConnector:
 
             # Parse fans
             for fan in thermal.get("Fans", []):
+                percent = (
+                    self._coerce_int(fan.get("Oem", {}).get("Dell", {}).get("PWM"))
+                    or self._coerce_int(fan.get("PercentAvailable"))
+                )
                 fan_sensor = FanSensor(
                     name=fan.get("Name", "Unknown"),
                     rpm=fan.get("Reading", 0),
                     member_id=fan.get("MemberId", ""),
+                    percent=percent,
                     health=fan.get("Status", {}).get("Health", "Unknown"),
                 )
                 data.fans.append(fan_sensor)
@@ -253,6 +316,53 @@ class IdracConnector:
             logger.error(f"Failed to get sensors from {self.ip}: {e}")
 
         return data
+
+    async def get_fan_inventory(self) -> list[dict]:
+        """Get live fan RPM + percentage readings.
+
+        Prefer WS-Man/DCIM_FanView because older iDRAC generations expose PWM
+        percentages there more reliably than Redfish. Fall back to Redfish
+        thermal data when WS-Man fan inventory is unavailable.
+        """
+        try:
+            fan_rows = await self._wsman_enumerate("DCIM_FanView")
+            parsed = []
+            for row in fan_rows:
+                parsed.append({
+                    "name": row.get("DeviceDescription") or row.get("FQDD") or row.get("InstanceID") or "Fan",
+                    "member_id": row.get("FQDD") or row.get("InstanceID") or "",
+                    "rpm": self._coerce_int(row.get("CurrentReading")) or 0,
+                    "percent": self._coerce_int(row.get("PWM")),
+                    "health": self._status_label(row.get("PrimaryStatus")),
+                    "source": "wsman",
+                })
+            parsed = [fan for fan in parsed if fan["rpm"] > 0 or fan["percent"] is not None]
+            if parsed:
+                return parsed
+        except (IdracError, IdracConnectionError) as exc:
+            logger.info(f"Falling back to Redfish fan telemetry for {self.ip}: {exc}")
+
+        thermal = await self._request("/redfish/v1/Chassis/System.Embedded.1/Thermal/")
+        parsed = []
+        for fan in thermal.get("Fans", []):
+            reading = self._coerce_int(fan.get("Reading")) or 0
+            percent = (
+                self._coerce_int(fan.get("Oem", {}).get("Dell", {}).get("PWM"))
+                or self._coerce_int(fan.get("PercentAvailable"))
+            )
+            if percent is None:
+                upper = self._coerce_int(fan.get("UpperThresholdCritical")) or self._coerce_int(fan.get("MaxReadingRange"))
+                if upper and upper > 0 and reading > 0:
+                    percent = max(1, min(100, round((reading / upper) * 100)))
+            parsed.append({
+                "name": fan.get("FanName") or fan.get("Name") or "Fan",
+                "member_id": fan.get("MemberId") or fan.get("Id") or "",
+                "rpm": reading,
+                "percent": percent,
+                "health": fan.get("Status", {}).get("Health", "Unknown"),
+                "source": "redfish",
+            })
+        return parsed
 
     async def get_power_state(self) -> str:
         """Get current power state of the server."""
@@ -289,18 +399,212 @@ class IdracConnector:
         if self._drac_version != "idrac7":
             logger.warning("WS-Man fan control is for iDRAC7. Use set_fan_mode_redfish for iDRAC8.")
 
-        if mode == "Manual" and speed_percent is not None:
-            # Set fan speed via DCIM_CoolingUnitView
-            xml = self._wsman_set_fan_speed(speed_percent)
-        else:
-            # Set fan mode
-            xml = self._wsman_set_fan_mode(mode)
-
         try:
-            await self._request_wsman(xml)
+            if mode == "Manual" and speed_percent is not None:
+                # iDRAC7 needs both steps: switch thermal policy to Manual,
+                # then set the desired fan speed.
+                await self._request_wsman(self._wsman_set_fan_mode("Manual"))
+                await self._request_wsman(self._wsman_set_fan_speed(speed_percent))
+            else:
+                await self._request_wsman(self._wsman_set_fan_mode(mode))
             return True
         except IdracError as e:
             logger.error(f"Failed to set fan mode via WS-Man: {e}")
+            return False
+
+    async def set_fan_mode_ipmi(self, mode: str, speed_percent: Optional[int] = None) -> bool:
+        """Set fan mode via Dell OEM IPMI raw commands.
+
+        Works well on older Dell iDRAC generations where WS-Man/Redfish
+        fan control actions are inconsistent.
+
+        Manual mode sequence:
+        - raw 0x30 0x30 0x01 0x00  -> enable manual mode
+        - raw 0x30 0x30 0x02 0xff <pct> -> set fan speed percent
+
+        Auto/Profile sequence:
+        - raw 0x30 0x30 0x01 0x01  -> return control to iDRAC automatic mode
+        """
+        if pyghmi_command is None:
+            logger.error("pyghmi is not installed; cannot use IPMI fan control")
+            return False
+
+        logger.info(f"Using IPMI fan control on {self.ip}: mode={mode} speed={speed_percent}")
+
+        script = r'''
+import sys
+from pyghmi.ipmi import command as pyghmi_command
+ip, username, password, mode, speed = sys.argv[1:6]
+ipmi = pyghmi_command.Command(bmc=ip, userid=username, password=password)
+try:
+    if mode == "Manual":
+        pct = max(1, min(100, int(speed)))
+        resp1 = ipmi.raw_command(netfn=0x30, command=0x30, data=[0x01, 0x00])
+        if resp1.get("code", 0) != 0:
+            raise SystemExit(f"IPMI manual mode failed: {resp1}")
+        resp2 = ipmi.raw_command(netfn=0x30, command=0x30, data=[0x02, 0xff, pct])
+        if resp2.get("code", 0) != 0:
+            raise SystemExit(f"IPMI set speed failed: {resp2}")
+        print(f"manual:{pct}")
+    else:
+        resp = ipmi.raw_command(netfn=0x30, command=0x30, data=[0x01, 0x01])
+        if resp.get("code", 0) != 0:
+            raise SystemExit(f"IPMI auto mode failed: {resp}")
+        print("auto")
+finally:
+    try:
+        ipmi.ipmi_session.logout()
+    except Exception:
+        pass
+'''
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                script,
+                self.ip,
+                self.username,
+                self.password,
+                mode,
+                str(speed_percent or 0),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                raise IdracError((stderr or stdout).decode().strip() or f"IPMI subprocess failed with code {proc.returncode}")
+            result = stdout.decode().strip()
+            if mode == "Manual" and speed_percent is not None:
+                logger.info(f"IPMI manual fan speed applied on {self.ip}: {speed_percent}% ({result})")
+            else:
+                logger.info(f"IPMI automatic fan control restored on {self.ip} ({result})")
+            self._fan_control_backend = "ipmi"
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set fan mode via IPMI: {e}")
+            return False
+
+    async def _run_racadm(self, args: list[str], timeout: int = 60) -> subprocess.CompletedProcess:
+        """Run local racadm against the remote iDRAC."""
+        racadm = shutil.which("racadm")
+        if not racadm:
+            raise IdracError("racadm is not installed")
+
+        cmd = [racadm, "-r", self.ip, "-u", self.username, "-p", self.password, *args]
+        proc = await asyncio.to_thread(
+            subprocess.run,
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            raise IdracError(f"racadm {' '.join(args)} failed: {detail}")
+        return proc
+
+    async def get_thermal_settings_racadm(self) -> dict[str, str]:
+        """Read current Dell thermal settings via racadm."""
+        proc = await self._run_racadm(["get", "system.thermalsettings"])
+        settings: dict[str, str] = {}
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if not line or line.startswith("Security Alert:") or line.startswith("Continuing execution"):
+                continue
+            if line.startswith("[") or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, value = line.split("=", 1)
+                settings[key.strip()] = value.strip()
+        return settings
+
+    async def set_fan_mode_racadm(self, mode: str, speed_percent: Optional[int] = None) -> bool:
+        """Set fan control via racadm thermal settings.
+
+        This is an iDRAC7 fallback for systems where Dell OEM IPMI fan control
+        is unavailable to the configured account. It is slower than IPMI, but
+        live testing showed it works reliably on the R530 path.
+        """
+        try:
+            if mode == "Manual" and speed_percent is not None:
+                clamped = max(1, min(100, int(speed_percent)))
+                await self._run_racadm(
+                    ["set", "system.thermalsettings.MinimumFanSpeed", str(clamped)],
+                    timeout=120,
+                )
+                logger.info(f"racadm manual fan speed applied on {self.ip}: {clamped}%")
+            else:
+                # On boxes where racadm MinimumFanSpeed overrides are supported,
+                # 255 is the automatic/default sentinel.
+                await self._run_racadm(
+                    ["set", "system.thermalsettings.MinimumFanSpeed", "255"],
+                    timeout=120,
+                )
+                logger.info(f"racadm automatic fan control restored on {self.ip}")
+
+            self._fan_control_backend = "racadm"
+            return True
+        except IdracError as e:
+            logger.error(f"Failed to set fan mode via racadm: {e}")
+            return False
+
+    async def set_fan_mode_redfish(self, mode: str, speed_percent: Optional[int] = None) -> bool:
+        """Set fan control mode via Redfish (iDRAC8+).
+
+        Uses Dell OEM ThermalService to set thermal policy and fan speed.
+
+        Args:
+            mode: 'Auto', 'Manual', or 'Profile'
+            speed_percent: Fan speed 1-100 (only for Manual mode)
+        """
+        if self._drac_version != "idrac8":
+            logger.warning("Redfish fan control is for iDRAC8+. Use set_fan_mode_wsman for iDRAC7.")
+
+        try:
+            # Get the ThermalService path
+            thermal = await self._request("/redfish/v1/Chassis/System.Embedded.1/Thermal/")
+            thermal_service_path = thermal.get("@odata.id", "")
+
+            if not thermal_service_path:
+                logger.error("No ThermalService path found in Redfish response")
+                return False
+
+            # Get the ThermalService details
+            thermal_service = await self._request(thermal_service_path)
+
+            # Get Dell OEM ThermalService
+            dell_thermal = thermal_service.get("Oem", {}).get("Dell", {}).get("ThermalService", {})
+            dell_thermal_path = dell_thermal.get("@odata.id", "")
+
+            if not dell_thermal_path:
+                logger.error("No Dell ThermalService path found in Redfish response")
+                return False
+
+            if mode == "Manual" and speed_percent is not None:
+                await self._request(
+                    f"{dell_thermal_path}/Actions/DellThermalService.SetThermalPolicy",
+                    method="POST",
+                    json_body={"ThermalPolicy": "Manual"},
+                )
+                # Set fan speed via Dell ThermalService SetFanSpeed
+                clamped = max(1, min(100, speed_percent))
+                await self._request(
+                    f"{dell_thermal_path}/Actions/DellThermalService.SetFanSpeed",
+                    method="POST",
+                    json_body={"FanSpeedPercent": clamped},
+                )
+            else:
+                # Set thermal policy via Dell ThermalService SetThermalPolicy
+                await self._request(
+                    f"{dell_thermal_path}/Actions/DellThermalService.SetThermalPolicy",
+                    method="POST",
+                    json_body={"ThermalPolicy": mode},
+                )
+
+            return True
+        except IdracError as e:
+            logger.error(f"Failed to set fan mode via Redfish: {e}")
             return False
 
     def _wsman_identify(self) -> str:
@@ -323,20 +627,23 @@ class IdracConnector:
         """WS-Man envelope for setting fan thermal policy."""
         return f'''<?xml version="1.0" encoding="UTF-8"?>
 <env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope"
-              xmlns:wsmid="http://schemas.dmtf.org/wbem/wsman/identity/1/wsmanidentity.xsd"
-              xmlns:n1="http://schemas.dell.com/wbem/wscim/1/cim-schema/2/DCIM_ThermalService">
+ xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"
+ xmlns:wsman="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd"
+ xmlns:n1="http://schemas.dell.com/wbem/wscim/1/cim-schema/2/DCIM_ThermalService">
   <env:Header>
-    <wsmid:ResourceURI xmlns:wsmid="http://schemas.dmtf.org/wbem/wsman/identity/1/wsmanidentity.xsd">
-      http://schemas.dell.com/wbem/wscim/1/cim-schema/2/DCIM_ThermalService:DCIM_ThermalService
-    </wsmid:ResourceURI>
-    <wsmid:Address xmlns:wsmid="http://schemas.dmtf.org/wbem/wsman/identity/1/wsmanidentity.xsd">
-      CIMV2:DCIM_ThermalService.InstanceID="Dell Thermal Service"
-    </wsmid:Address>
+    <wsa:To>/wsman</wsa:To>
+    <wsman:ResourceURI>http://schemas.dell.com/wbem/wscim/1/cim-schema/2/DCIM_ThermalService</wsman:ResourceURI>
+    <wsa:Action>http://schemas.dell.com/wbem/wscim/1/cim-schema/2/DCIM_ThermalService/DCIM_ThermalService_SetThermalPolicy</wsa:Action>
+    <wsa:MessageID>uuid:00000000-0000-0000-0000-000000000002</wsa:MessageID>
+    <wsa:ReplyTo><wsa:Address>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</wsa:Address></wsa:ReplyTo>
+    <wsman:SelectorSet>
+      <wsman:Selector Name="InstanceID">Dell Thermal Service</wsman:Selector>
+    </wsman:SelectorSet>
   </env:Header>
   <env:Body>
-    <n1:DCIM_ThermalService_SetThermalPolicy>
+    <n1:DCIM_ThermalService_SetThermalPolicy_INPUT>
       <n1:ThermalPolicy>{mode}</n1:ThermalPolicy>
-    </n1:DCIM_ThermalService_SetThermalPolicy>
+    </n1:DCIM_ThermalService_SetThermalPolicy_INPUT>
   </env:Body>
 </env:Envelope>'''
 
@@ -345,17 +652,23 @@ class IdracConnector:
         clamped = max(1, min(100, speed_percent))
         return f'''<?xml version="1.0" encoding="UTF-8"?>
 <env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope"
-              xmlns:wsmid="http://schemas.dmtf.org/wbem/wsman/identity/1/wsmanidentity.xsd"
-              xmlns:n1="http://schemas.dell.com/wbem/wscim/1/cim-schema/2/DCIM_CoolingUnitView">
+ xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"
+ xmlns:wsman="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd"
+ xmlns:n1="http://schemas.dell.com/wbem/wscim/1/cim-schema/2/DCIM_CoolingUnitView">
   <env:Header>
-    <wsmid:ResourceURI xmlns:wsmid="http://schemas.dmtf.org/wbem/wsman/identity/1/wsmanidentity.xsd">
-      http://schemas.dell.com/wbem/wscim/1/cim-schema/2/DCIM_CoolingUnitView:DCIM_CoolingUnitView
-    </wsmid:ResourceURI>
+    <wsa:To>/wsman</wsa:To>
+    <wsman:ResourceURI>http://schemas.dell.com/wbem/wscim/1/cim-schema/2/DCIM_CoolingUnitView</wsman:ResourceURI>
+    <wsa:Action>http://schemas.dell.com/wbem/wscim/1/cim-schema/2/DCIM_CoolingUnitView/DCIM_CoolingUnitView_SetDesiredSpeed</wsa:Action>
+    <wsa:MessageID>uuid:00000000-0000-0000-0000-000000000003</wsa:MessageID>
+    <wsa:ReplyTo><wsa:Address>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</wsa:Address></wsa:ReplyTo>
+    <wsman:SelectorSet>
+      <wsman:Selector Name="InstanceID">Dell Cooling Unit</wsman:Selector>
+    </wsman:SelectorSet>
   </env:Header>
   <env:Body>
-    <n1:DCIM_CoolingUnitView_SetDesiredSpeed>
+    <n1:DCIM_CoolingUnitView_SetDesiredSpeed_INPUT>
       <n1:DesiredSpeed>{clamped}</n1:DesiredSpeed>
-    </n1:DCIM_CoolingUnitView_SetDesiredSpeed>
+    </n1:DCIM_CoolingUnitView_SetDesiredSpeed_INPUT>
   </env:Body>
 </env:Envelope>'''
 
@@ -374,86 +687,229 @@ class IdracConnector:
   </env:Body>
 </env:Envelope>'''
 
+    @staticmethod
+    def _wsman_envelope(resource_uri: str) -> str:
+        """Optimized WS-Man Enumerate envelope for Dell DCIM classes."""
+        return f'''<?xml version="1.0" encoding="UTF-8"?>
+<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope"
+ xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"
+ xmlns:wsman="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd"
+ xmlns:wsen="http://schemas.xmlsoap.org/ws/2004/09/enumeration">
+  <env:Header>
+    <wsa:To>/wsman</wsa:To>
+    <wsman:ResourceURI>{resource_uri}</wsman:ResourceURI>
+    <wsa:Action>http://schemas.xmlsoap.org/ws/2004/09/enumeration/Enumerate</wsa:Action>
+    <wsa:MessageID>uuid:00000000-0000-0000-0000-000000000001</wsa:MessageID>
+    <wsa:ReplyTo><wsa:Address>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</wsa:Address></wsa:ReplyTo>
+  </env:Header>
+  <env:Body>
+    <wsen:Enumerate>
+      <wsman:OptimizeEnumeration/>
+      <wsman:MaxElements>128</wsman:MaxElements>
+    </wsen:Enumerate>
+  </env:Body>
+</env:Envelope>'''
+
+
+    @staticmethod
+    def _xml_local_name(tag: str) -> str:
+        return tag.split('}', 1)[1] if '}' in tag else tag
+
+    @staticmethod
+    def _status_label(value) -> str:
+        mapping = {
+            '0': 'Unknown',
+            '1': 'OK',
+            '2': 'Degraded',
+            '3': 'Critical',
+            '4': 'NonRecoverable',
+        }
+        return mapping.get(str(value), str(value) if value is not None else 'Unknown')
+
+    @staticmethod
+    def _power_state_label(value) -> str:
+        mapping = {
+            '1': 'Other',
+            '2': 'On',
+            '3': 'Off',
+            '4': 'PowerCycle',
+            '5': 'PoweringOn',
+            '6': 'PoweringOff',
+        }
+        return mapping.get(str(value), str(value) if value is not None else 'Unknown')
+
+    @staticmethod
+    def _coerce_int(value) -> Optional[int]:
+        try:
+            if value is None or value == "":
+                return None
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+    async def _wsman_enumerate(self, class_name: str) -> list[dict]:
+        """Enumerate a Dell DCIM WS-Man class and return instance dicts."""
+        resource_uri = f"http://schemas.dell.com/wbem/wscim/1/cim-schema/2/{class_name}"
+        response = await self._request_wsman(self._wsman_envelope(resource_uri))
+        root = ET.fromstring(response)
+        items = root.findall('.//{http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd}Items/*')
+        parsed: list[dict] = []
+        for item in items:
+            row: dict = {}
+            for child in item:
+                key = self._xml_local_name(child.tag)
+                value = child.text
+                if key in row:
+                    existing = row[key]
+                    if isinstance(existing, list):
+                        existing.append(value)
+                    else:
+                        row[key] = [existing, value]
+                else:
+                    row[key] = value
+            if row:
+                parsed.append(row)
+        return parsed
+
+
     # ─── User Management ──────────────────────────────────────────────
 
     async def list_idrac_users(self) -> list[dict]:
-        """List all iDRAC user accounts."""
-        try:
-            data = await self._request("/redfish/v1/Managers/iDRAC.Embedded.1/Accounts/")
-            users = []
-            for account in data.get("Members", []):
-                account_path = account.get("@odata.id", "")
-                if account_path:
-                    account_data = await self._request(account_path)
-                    users.append({
-                        "id": account_data.get("Id"),
-                        "username": account_data.get("UserName", ""),
-                        "enabled": account_data.get("Enabled", False),
-                        "role": account_data.get("RoleId", ""),
-                        "role_name": account_data.get("RoleName", ""),
-                    })
-            return users
-        except IdracError:
-            # iDRAC7 fallback — try Dell OEM endpoint
+        """List iDRAC user account slots.
+
+        Older iDRAC7 systems have proven more reliable when account slots are
+        probed directly in numeric order instead of walking the collection or
+        fanning out concurrent detail requests.
+        """
+        users: list[dict] = []
+        for account_id in range(1, 17):
             try:
-                data = await self._request("/redfish/v1/Managers/iDRAC.Embedded.1/Oem/Dell/DellLCService/DellLCManager/")
-                return []
+                account_data = await self._request(f"/redfish/v1/Managers/iDRAC.Embedded.1/Accounts/{account_id}")
+                username = (account_data.get("UserName") or "").strip()
+                if not username:
+                    continue
+                users.append({
+                    "id": account_data.get("Id"),
+                    "username": username,
+                    "enabled": account_data.get("Enabled", False),
+                    "role": account_data.get("RoleId", ""),
+                    "role_name": account_data.get("RoleName", ""),
+                    "privileges": account_data.get("Privileges", []),
+                    "lan_privilege": account_data.get("MaximumLANUserPrivilegeGranted", ""),
+                    "serial_privilege": account_data.get("MaximumSerialPortUserPrivilegeGranted", ""),
+                    "access": account_data.get("Access", ""),
+                })
             except IdracError:
-                logger.warning(f"Cannot list users on {self.ip}")
-                return []
+                continue
+        return users
 
     async def create_user(self, username: str, password: str, role: str = "ReadOnly") -> str:
-        """Create a user on iDRAC. Returns status string."""
-        try:
-            # Find next available user slot
-            users = await self.list_idrac_users()
+        """Create or update a user on iDRAC.
 
-            # Check if user already exists
-            for u in users:
-                if u["username"] == username:
-                    # Update existing user
-                    await self._request(
-                        f"/redfish/v1/Managers/iDRAC.Embedded.1/Accounts/{u['id']}",
-                        method="PATCH",
-                        json_body={
-                            "Password": password,
-                            "Enabled": True,
-                        },
-                    )
-                    return "success"
+        Newer iDRAC Redfish implementations accept numeric RoleId plus privilege
+        fields. Older iDRAC7 implementations reject those fields and only accept
+        a small PATCH body with a string RoleId (for example ``Operator``).
 
-            # Find an empty slot (max 16 accounts, 0 and 1 are root/calvin)
-            for i in range(2, 16):
+        This method now tries the richer payload first, then falls back to an
+        iDRAC7-compatible payload before failing.
+        """
+        # Map role name to Redfish RoleId, Privileges, and IPMI privilege levels
+        role_map = {
+            "Administrator": {
+                "role_id": "500",
+                "role_id_string": "Administrator",
+                "privileges": ["Login", "ConfigureUsers", "ConfigureComponents", "ConfigureSelf", "RemoteConsole", "VirtualMedia", "Debug"],
+                "lan_privilege": "Administrator",
+                "serial_privilege": "Administrator",
+                "access": "Administrator",
+            },
+            "Operator": {
+                "role_id": "501",
+                "role_id_string": "Operator",
+                "privileges": ["Login", "ConfigureComponents", "ConfigureSelf", "RemoteConsole", "VirtualMedia"],
+                "lan_privilege": "Operator",
+                "serial_privilege": "Operator",
+                "access": "Operator",
+            },
+            "ReadOnly": {
+                "role_id": "502",
+                "role_id_string": "ReadOnly",
+                "privileges": ["Login", "RemoteConsole", "VirtualMedia"],
+                "lan_privilege": "User",
+                "serial_privilege": "User",
+                "access": "User",
+            },
+        }
+        role_config = role_map.get(role, role_map["ReadOnly"])
+
+        def payloads(include_username: bool) -> list[dict]:
+            modern_payload = {
+                "Password": password,
+                "Enabled": True,
+                "RoleId": role_config["role_id"],
+                "Privileges": role_config["privileges"],
+                "MaximumLANUserPrivilegeGranted": role_config["lan_privilege"],
+                "MaximumSerialPortUserPrivilegeGranted": role_config["serial_privilege"],
+                "Access": role_config["access"],
+            }
+            legacy_payload = {
+                "Password": password,
+                "Enabled": True,
+                "RoleId": role_config["role_id_string"],
+            }
+            if include_username:
+                modern_payload = {"UserName": username, **modern_payload}
+                legacy_payload = {"UserName": username, **legacy_payload}
+            return [modern_payload, legacy_payload]
+
+        async def patch_account(account_id: str | int, include_username: bool) -> None:
+            account_path = f"/redfish/v1/Managers/iDRAC.Embedded.1/Accounts/{account_id}"
+            last_error: Optional[IdracError] = None
+            for body in payloads(include_username):
                 try:
-                    account = await self._request(f"/redfish/v1/Managers/iDRAC.Embedded.1/Accounts/{i}")
-                    if not account.get("UserName"):
-                        # Empty slot found
-                        body = {
-                            "UserName": username,
-                            "Password": password,
-                            "Enabled": True,
-                        }
-                        # Map role name to RoleId
-                        role_map = {
-                            "Administrator": "500",
-                            "Operator": "501",
-                            "ReadOnly": "502",
-                        }
-                        body["RoleId"] = role_map.get(role, "502")
-                        await self._request(
-                            f"/redfish/v1/Managers/iDRAC.Embedded.1/Accounts/{i}",
-                            method="PATCH",
-                            json_body=body,
-                        )
-                        return "success"
-                except IdracError:
-                    continue
+                    await self._request(account_path, method="PATCH", json_body=body)
+                    return
+                except IdracError as e:
+                    last_error = e
+                    logger.info(
+                        "Account PATCH failed on %s for %s with body keys %s: %s",
+                        self.ip,
+                        username,
+                        sorted(body.keys()),
+                        e,
+                    )
+            if last_error is not None:
+                raise last_error
+            raise IdracError("Unknown account patch failure")
 
-            return "failed"
+        first_empty_slot: Optional[int] = None
+        for slot_id in range(2, 17):
+            try:
+                account = await self._request(f"/redfish/v1/Managers/iDRAC.Embedded.1/Accounts/{slot_id}")
+            except IdracError:
+                continue
 
-        except IdracError as e:
-            logger.error(f"Failed to create user {username} on {self.ip}: {e}")
-            return "failed"
+            slot_username = (account.get("UserName") or "").strip()
+            if slot_username == username:
+                try:
+                    await patch_account(slot_id, include_username=False)
+                    return "success"
+                except IdracError as e:
+                    logger.error(f"Failed to update user {username} on {self.ip}: {e}")
+                    raise
+
+            if first_empty_slot is None and not slot_username:
+                first_empty_slot = slot_id
+
+        if first_empty_slot is not None:
+            try:
+                await patch_account(first_empty_slot, include_username=True)
+                return "success"
+            except IdracError as e:
+                logger.warning(f"Failed to create user {username} in slot {first_empty_slot} on {self.ip}: {e}")
+                raise
+
+        raise IdracError("No compatible empty iDRAC account slot was accepted")
 
     async def delete_user(self, username: str) -> bool:
         """Delete a user from iDRAC."""
@@ -511,56 +967,124 @@ class IdracConnector:
             return {}
 
     async def get_hardware_inventory(self) -> dict:
-        """Get full hardware inventory: CPUs, memory, drives, PSUs, NICs."""
+        """Get hardware inventory summary for UI display.
+
+        Prefer WS-Man on iDRAC7 because the Dell DCIM classes expose richer,
+        flatter inventory data than the limited Redfish implementation.
+        """
+        try:
+            if self._drac_version is None:
+                await self.detect_version()
+        except IdracError:
+            # If version detection is flaky, keep going and try the existing
+            # Redfish path below.
+            pass
+
+        if self._drac_version == "idrac7":
+            try:
+                system_rows = await self._wsman_enumerate("DCIM_SystemView")
+                cpu_rows = await self._wsman_enumerate("DCIM_CPUView")
+                memory_rows = await self._wsman_enumerate("DCIM_MemoryView")
+                controller_rows = await self._wsman_enumerate("DCIM_ControllerView")
+                disk_rows = await self._wsman_enumerate("DCIM_PhysicalDiskView")
+                nic_rows = await self._wsman_enumerate("DCIM_NICView")
+                psu_rows = await self._wsman_enumerate("DCIM_PowerSupplyView")
+
+                system = system_rows[0] if system_rows else {}
+                populated_memory = [row for row in memory_rows if str(row.get("Size") or "0") not in ("0", "None", "")]
+
+                return {
+                    "source": "wsman",
+                    "protocol": "WS-Man",
+                    "model": system.get("Model") or system.get("SystemGeneration") or "Unknown",
+                    "service_tag": system.get("ServiceTag") or system.get("ChassisServiceTag") or "",
+                    "bios_version": system.get("BIOSVersionString") or "Unknown",
+                    "idrac_firmware": system.get("LifecycleControllerVersion") or self._firmware_version or "Unknown",
+                    "power_state": self._power_state_label(system.get("PowerState")),
+                    "system_health": self._status_label(system.get("RollupStatus") or system.get("CurrentRollupStatus") or system.get("PrimaryStatus")),
+                    "cpu_health": self._status_label(system.get("CPURollupStatus")),
+                    "memory_health": self._status_label(system.get("MemoryRollupStatus") or system.get("SysMemPrimaryStatus")),
+                    "storage_health": self._status_label(system.get("StorageRollupStatus")),
+                    "fan_health": self._status_label(system.get("FanRollupStatus")),
+                    "power_health": self._status_label(system.get("PSRollupStatus")),
+                    "cpu_count": len(cpu_rows),
+                    "memory_module_count": len(populated_memory),
+                    "memory_total_mb": system.get("SysMemTotalSize") or "0",
+                    "storage_controller_count": len(controller_rows),
+                    "disk_count": len(disk_rows),
+                    "nic_count": len(nic_rows),
+                    "power_supply_count": len(psu_rows),
+                    "system": system,
+                    "processors": cpu_rows,
+                    "memory_modules": populated_memory,
+                    "storage_controllers": controller_rows,
+                    "disks": disk_rows,
+                    "ethernet_interfaces": nic_rows,
+                    "power_supplies": psu_rows,
+                }
+            except IdracError as e:
+                logger.warning("WS-Man hardware inventory failed on %s, falling back to Redfish: %s", self.ip, e)
+
         result = {}
         try:
             system = await self._request("/redfish/v1/Systems/System.Embedded.1/")
             chassis = await self._request("/redfish/v1/Chassis/System.Embedded.1/")
-
-            # Processors
-            result["processors"] = system.get("Processors", [])
-
-            # Memory
             memory = await self._request("/redfish/v1/Systems/System.Embedded.1/Memory/")
-            result["memory"] = memory.get("Members", [])
-            memory_details = []
-            for m in memory.get("Members", []):
-                try:
-                    detail = await self._request(m.get("@odata.id", ""))
-                    memory_details.append(detail)
-                except IdracError:
-                    pass
-            result["memory_details"] = memory_details
-
-            # Storage controllers
             storage = await self._request("/redfish/v1/Systems/System.Embedded.1/Storage/")
-            result["storage_controllers"] = storage.get("Members", [])
-            for s in storage.get("Members", []):
-                try:
-                    detail = await self._request(s.get("@odata.id", ""))
-                    drives_path = detail.get("Drives", [])
-                    drives_detail = []
-                    for d in drives_path:
-                        try:
-                            drive = await self._request(d.get("@odata.id", ""))
-                            drives_detail.append(drive)
-                        except IdracError:
-                            pass
-                    result.setdefault("drives", []).extend(drives_detail)
-                except IdracError:
-                    pass
-
-            # Power supplies
-            result["power_supplies"] = chassis.get("PowerControls", [])
-
-            # NICs
             nic_collection = await self._request("/redfish/v1/Systems/System.Embedded.1/EthernetInterfaces/")
-            result["ethernet_interfaces"] = nic_collection.get("Members", [])
+
+            memory_members = memory.get("Members", [])
+            storage_members = storage.get("Members", [])
+            nic_members = nic_collection.get("Members", [])
+
+            result = {
+                "source": "redfish",
+                "protocol": "Redfish",
+                "model": system.get("Model"),
+                "service_tag": system.get("AssetTag") or chassis.get("SerialNumber") or "",
+                "bios_version": system.get("BiosVersion"),
+                "idrac_firmware": self._firmware_version or "Unknown",
+                "power_state": system.get("PowerState"),
+                "system_health": (system.get("Status") or {}).get("Health", "Unknown"),
+                "cpu_count": ((system.get("ProcessorSummary") or {}).get("Count") or len(system.get("Processors", []))),
+                "memory_module_count": len(memory_members),
+                "memory_total_gib": ((system.get("MemorySummary") or {}).get("TotalSystemMemoryGiB")),
+                "storage_controller_count": len(storage_members),
+                "nic_count": len(nic_members),
+                "system": {
+                    "Id": system.get("Id"),
+                    "Name": system.get("Name"),
+                    "Manufacturer": system.get("Manufacturer"),
+                    "Model": system.get("Model"),
+                    "PartNumber": system.get("PartNumber"),
+                    "SerialNumber": system.get("SerialNumber"),
+                    "PowerState": system.get("PowerState"),
+                    "BiosVersion": system.get("BiosVersion"),
+                    "ProcessorSummary": system.get("ProcessorSummary"),
+                    "MemorySummary": system.get("MemorySummary"),
+                    "Status": system.get("Status"),
+                },
+                "chassis": {
+                    "Id": chassis.get("Id"),
+                    "Name": chassis.get("Name"),
+                    "Manufacturer": chassis.get("Manufacturer"),
+                    "Model": chassis.get("Model"),
+                    "SerialNumber": chassis.get("SerialNumber"),
+                    "ChassisType": chassis.get("ChassisType"),
+                    "Status": chassis.get("Status"),
+                },
+                "processors": system.get("Processors", []),
+                "memory_modules": memory_members,
+                "storage_controllers": storage_members,
+                "ethernet_interfaces": nic_members,
+                "power_supplies": chassis.get("PowerControls", []),
+            }
 
         except IdracError as e:
             logger.error(f"Failed to get hardware inventory from {self.ip}: {e}")
 
         return result
+
 
     async def get_power_settings(self) -> dict:
         """Get power management settings."""
@@ -587,39 +1111,23 @@ class IdracConnector:
         return result
 
     async def get_storage_settings(self) -> dict:
-        """Get RAID/storage configuration."""
+        """Get storage configuration summary quickly for UI display."""
         result = {}
         try:
             storage = await self._request("/redfish/v1/Systems/System.Embedded.1/Storage/")
             controllers = []
-            for s in storage.get("Members", []):
-                try:
-                    detail = await self._request(s.get("@odata.id", ""))
-                    # Virtual disks
-                    vd_path = detail.get("Volumes", [])
-                    volumes = []
-                    for v in vd_path:
-                        try:
-                            vol = await self._request(v.get("@odata.id", ""))
-                            volumes.append(vol)
-                        except IdracError:
-                            pass
-                    detail["volumes"] = volumes
-
-                    # Physical drives
-                    drives = []
-                    for d in detail.get("Drives", []):
-                        try:
-                            drive = await self._request(d.get("@odata.id", ""))
-                            drives.append(drive)
-                        except IdracError:
-                            pass
-                    detail["drives"] = drives
-
-                    controllers.append(detail)
-                except IdracError:
-                    pass
+            for detail in await self._request_many(storage.get("Members", [])):
+                controllers.append({
+                    "Id": detail.get("Id"),
+                    "Name": detail.get("Name"),
+                    "Description": detail.get("Description"),
+                    "Status": detail.get("Status"),
+                    "Drives": detail.get("Drives", []),
+                    "Volumes": detail.get("Volumes", []),
+                    "Links": detail.get("Links", {}),
+                })
             result["controllers"] = controllers
+            result["controller_count"] = len(controllers)
         except IdracError as e:
             logger.error(f"Failed to get storage settings from {self.ip}: {e}")
         return result

@@ -1,15 +1,19 @@
-import type { Server, SensorReading, FanConfig, FanControlResult, SensorSummary, User, ServerGroup, TempProfile } from './types';
+import type { Server, SensorReading, FanConfig, FanControlResult, FanTelemetryResponse, SensorSummary, User, ServerGroup, TempProfile } from './types';
 
 const API = '';
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const token = localStorage.getItem('dsm_token');
-  const headers: Record<string, string> = { 'Accept': 'application/json' };
-  if (token) headers['Authorization'] = `Bearer ${token}`;
+  const baseHeaders: Record<string, string> = { 'Accept': 'application/json' };
+  if (token) baseHeaders['Authorization'] = `Bearer ${token}`;
+  const requestHeaders = {
+    ...baseHeaders,
+    ...(options?.headers || {}),
+  };
 
   const resp = await fetch(`${API}${path}`, {
-    headers,
     ...options,
+    headers: requestHeaders,
   });
 
   if (resp.status === 401) {
@@ -21,6 +25,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     const error = await resp.json().catch(() => ({ detail: resp.statusText }));
     throw new Error(error.detail || `HTTP ${resp.status}`);
   }
+  if (resp.status === 204) return undefined as T;
   return resp.json();
 }
 
@@ -38,7 +43,7 @@ export const api = {
 
   // Servers
   listServers: () => request<Server[]>('/servers/'),
-  addServer: (data: { name: string; ipmi_ip: string; ipmi_user: string; ipmi_password: string }) =>
+  addServer: (data: { name: string; ipmi_ip: string; ipmi_user: string; ipmi_password: string; drac_version?: string }) =>
     request<Server>('/servers/', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -73,6 +78,7 @@ export const api = {
 
   // Fans
   getFanConfig: (serverId: number) => request<FanConfig>(`/fans/${serverId}`),
+  getFanTelemetry: (serverId: number) => request<FanTelemetryResponse>(`/fans/${serverId}/telemetry`),
   updateFanConfig: (serverId: number, config: Partial<FanConfig>) =>
     request<FanConfig>(`/fans/${serverId}`, {
       method: 'PUT',

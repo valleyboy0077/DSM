@@ -121,43 +121,58 @@ async def remove_server(server_id: int) -> str:
 
 @mcp.tool()
 async def get_temperatures(server_id: int) -> str:
-    """Get current temperature sensor readings for a server.
+    """Get live temperature sensor readings for a server.
 
-    Returns CPU, disk, and ambient temperatures in Celsius.
+    Returns CPU, disk, and ambient temperatures in Celsius directly from iDRAC.
 
     Args:
         server_id: The numeric ID of the server.
     """
-    data = await _api(f"/sensors/?server_id={server_id}&sensor_type=cpu")
-    return json.dumps(data, indent=2)
+    data = await _api(f"/sensors/live/{server_id}")
+    return json.dumps({"server_id": server_id, "temperatures": data.get("temperatures", [])}, indent=2)
 
 
 @mcp.tool()
 async def get_fan_speeds(server_id: int) -> str:
-    """Get current fan speed readings for a server.
+    """Get live fan speed readings for a server.
 
-    Returns RPM and percentage for all fans.
+    Returns RPM/percentage entries directly from iDRAC.
 
     Args:
         server_id: The numeric ID of the server.
     """
-    data = await _api(f"/sensors/?server_id={server_id}&sensor_type=fan")
+    data = await _api(f"/sensors/live/{server_id}")
+    return json.dumps({"server_id": server_id, "fans": data.get("fans", [])}, indent=2)
+
+
+@mcp.tool()
+async def get_fan_telemetry(server_id: int) -> str:
+    """Get live fan telemetry from iDRAC for a server.
+
+    Returns the current fan RPM and percentage directly from the hardware.
+
+    Args:
+        server_id: The numeric ID of the server.
+    """
+    data = await _api(f"/fans/{server_id}/telemetry")
     return json.dumps(data, indent=2)
 
 
 @mcp.tool()
 async def get_all_sensors(server_id: int) -> str:
-    """Get all sensor readings (temperatures + fans) for a server.
+    """Get all live sensor readings (temperatures + fans) for a server.
 
     Args:
         server_id: The numeric ID of the server.
     """
-    temps = await get_temperatures(server_id)
-    fans = await get_fan_speeds(server_id)
+    data = await _api(f"/sensors/live/{server_id}")
     return json.dumps({
         "server_id": server_id,
-        "temperatures": json.loads(temps),
-        "fans": json.loads(fans),
+        "temperatures": data.get("temperatures", []),
+        "fans": data.get("fans", []),
+        "system_info": data.get("system_info"),
+        "collected_at": data.get("collected_at"),
+        "source": data.get("source"),
     }, indent=2)
 
 
@@ -191,10 +206,34 @@ async def set_fan_mode(server_id: int, mode: str, auto_control: bool = True) -> 
     if mode not in valid_modes:
         return f"Error: mode must be one of {valid_modes}"
 
+    if mode == "auto":
+        data = await _api(
+            f"/fans/{server_id}/control",
+            method="POST",
+            json_body={"action": "set_auto"},
+        )
+        return json.dumps(data, indent=2)
+
+    if mode == "profile":
+        data = await _api(
+            f"/fans/{server_id}/control",
+            method="POST",
+            json_body={"action": "reset"},
+        )
+        return json.dumps(data, indent=2)
+
+    # Manual mode requires a target speed, so reuse the persisted manual speed
+    # from the server's fan config if available.
+    try:
+        config = await _api(f"/fans/{server_id}")
+        manual_speed = int(config.get("manual_speed", 25))
+    except Exception:
+        manual_speed = 25
+
     data = await _api(
-        f"/fans/{server_id}",
-        method="PATCH",
-        json_body={"mode": mode, "auto_control": auto_control},
+        f"/fans/{server_id}/control",
+        method="POST",
+        json_body={"action": "set_manual", "speed": manual_speed},
     )
     return json.dumps(data, indent=2)
 
@@ -211,9 +250,9 @@ async def set_fan_speed(server_id: int, speed_percent: int) -> str:
     """
     clamped = max(1, min(100, speed_percent))
     data = await _api(
-        f"/fans/{server_id}",
-        method="PATCH",
-        json_body={"mode": "manual", "manual_speed": clamped},
+        f"/fans/{server_id}/control",
+        method="POST",
+        json_body={"action": "set_manual", "speed": clamped},
     )
     return json.dumps(data, indent=2)
 

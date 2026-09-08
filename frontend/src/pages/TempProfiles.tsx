@@ -20,192 +20,131 @@ export default function TempProfiles() {
   const [editingProfile, setEditingProfile] = useState<TempProfile | null>(null);
   const [ranges, setRanges] = useState<TempRange[]>(DEFAULT_RANGES);
   const [loading, setLoading] = useState(true);
+  const [saveMessage, setSaveMessage] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
-  const fetchServers = useCallback(async () => {
-    try {
-      const list = await api.listServers();
-      setServers(list);
-    } catch { /* ignore */ }
-  }, []);
-
+  const fetchServers = useCallback(async () => { try { setServers(await api.listServers()); } catch {} }, []);
   const fetchProfiles = useCallback(async () => {
-    if (!serverId) {
-      setProfiles([]);
-      setLoading(false);
-      return;
-    }
-    try {
-      setLoading(true);
-      const list = await api.listProfiles(serverId);
-      setProfiles(list);
-    } catch { /* ignore */ } finally {
-      setLoading(false);
-    }
+    if (!serverId) { setProfiles([]); setLoading(false); return; }
+    try { setLoading(true); setProfiles(await api.listProfiles(serverId)); } catch { setProfiles([]); } finally { setLoading(false); }
   }, [serverId]);
 
+  useEffect(() => { fetchServers(); }, [fetchServers]);
+  useEffect(() => { fetchProfiles(); }, [fetchProfiles]);
   useEffect(() => {
-    fetchServers();
-  }, [fetchServers]);
-
-  useEffect(() => {
-    fetchProfiles();
-  }, [fetchProfiles]);
-
-  useEffect(() => {
-    // When servers load, auto-select the first one if no selection yet
-    if (servers.length > 0 && !serverId) {
-      setSelectedServerId(servers[0].id);
-      setSearchParams({ server_id: String(servers[0].id) });
-    }
+    if (servers.length > 0 && !serverId) { setSelectedServerId(servers[0].id); setSearchParams({ server_id: String(servers[0].id) }); }
   }, [servers, serverId, setSearchParams]);
 
   const handleServerChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
     const id = parseInt(e.target.value, 10);
     setSelectedServerId(id);
+    setSaveMessage(null);
+    setSaveError(null);
     setSearchParams({ server_id: String(id) });
   };
 
   const handleSave = async () => {
     if (!editingProfile || !serverId) return;
+    setSaveMessage(null);
+    setSaveError(null);
+
     try {
       const data = { server_id: serverId, name: editingProfile.name, is_default: editingProfile.is_default, ranges };
-      if (editingProfile.id) {
-        await api.updateProfile(editingProfile.id, data);
-      } else {
-        await api.createProfile(serverId, data);
-      }
+      const savedProfile = editingProfile.id
+        ? await api.updateProfile(editingProfile.id, data)
+        : await api.createProfile(serverId, data);
+
+      await fetchProfiles();
       setEditingProfile(null);
       setRanges(DEFAULT_RANGES);
-      fetchProfiles();
+
+      const rangeCount = Array.isArray(savedProfile?.ranges) ? savedProfile.ranges.length : 0;
+      if (rangeCount === 0 && ranges.length > 0) {
+        setSaveError('Profile saved, but the server returned 0 ranges. Refreshing the list may show incomplete profile data.');
+      } else {
+        setSaveMessage(`Profile saved successfully with ${rangeCount} range${rangeCount === 1 ? '' : 's'}.`);
+      }
     } catch (err) {
       console.error('Failed to save profile:', err);
+      setSaveError(err instanceof Error ? err.message : 'Failed to save profile.');
     }
   };
 
   const handleDelete = async (id: number) => {
-    if (!confirm('Delete this profile?')) return;
-    try {
-      await api.deleteProfile(id);
-      fetchProfiles();
-    } catch (err) {
-      console.error('Failed to delete profile:', err);
-    }
+    if (!confirm('Delete this temperature profile?')) return;
+    try { await api.deleteProfile(id); fetchProfiles(); } catch (err) { console.error('Failed to delete profile:', err); }
   };
 
   if (servers.length === 0) {
-    return (
-      <div className="container">
-        <div className="card" style={{textAlign: 'center', padding: 40}}>
-          <h2 style={{fontSize: 18, marginBottom: 12}}>No Servers Available</h2>
-          <p style={{color: 'var(--text-secondary)'}}>
-            Add a server to Inventory first, then come back to manage temperature profiles.
-          </p>
-        </div>
-      </div>
-    );
+    return <div className="empty-state"><strong>No servers available</strong><p>Add a server to Inventory first, then manage temperature profiles.</p></div>;
   }
+
+  const selectedServer = servers.find(s => s.id === serverId);
 
   return (
     <div>
-      <div className="toolbar" style={{marginBottom: 16}}>
-        <h2 style={{fontSize: 18, margin: 0}}>Temperature Profiles</h2>
-        <div style={{flex: 1}} />
-        <label style={{color: 'var(--text-secondary)', fontSize: 13}}>Server:</label>
-        <select
-          value={serverId || ''}
-          onChange={handleServerChange}
-          style={{
-            padding: '4px 8px',
-            borderRadius: 4,
-            border: '1px solid var(--border)',
-            background: 'var(--bg-card)',
-            color: 'var(--text-primary)',
-          }}
-        >
-          {servers.map(s => (
-            <option key={s.id} value={s.id}>{s.name} ({s.ipmi_ip})</option>
-          ))}
-        </select>
-        <button
-          className="btn btn-primary"
-          onClick={() => {
-            setEditingProfile({
-              id: 0,
-              server_id: serverId!,
-              server_name: servers.find(s => s.id === serverId)?.name || '',
-              is_default: false,
-              name: 'New Profile',
-              ranges: [],
-              created_at: null,
-              updated_at: null,
-            } as TempProfile);
+      <div className="page-toolbar">
+        <div>
+          <h2 className="page-title">Thermal profiles</h2>
+          <p className="page-subtitle">Threshold ranges used by cooling policy and alert decisions.</p>
+        </div>
+        <div className="inline-form-row">
+          <label style={{ color: 'var(--text-secondary)', fontSize: 13 }}>Server</label>
+          <select value={serverId || ''} onChange={handleServerChange} style={{ minWidth: 240 }}>
+            {servers.map(s => <option key={s.id} value={s.id}>{s.name} ({s.ipmi_ip})</option>)}
+          </select>
+          <button className="btn btn-primary" onClick={() => {
+            setSaveMessage(null);
+            setSaveError(null);
+            setEditingProfile({ id: 0, server_id: serverId!, server_name: selectedServer?.name || '', is_default: false, name: 'New Profile', ranges: [], created_at: null, updated_at: null } as TempProfile);
             setRanges(DEFAULT_RANGES);
-          }}
-        >
-          + New Profile
-        </button>
+          }}>New Profile</button>
+        </div>
       </div>
 
-      {loading && <p style={{color: 'var(--text-secondary)'}}>Loading profiles...</p>}
+      {selectedServer && <div className="inline-alert" style={{ marginBottom: 18 }}>Editing profiles for <strong>{selectedServer.name}</strong> at <span className="mono">{selectedServer.ipmi_ip}</span>.</div>}
+      {saveMessage && <div className="inline-alert success" style={{ marginBottom: 18 }}>{saveMessage}</div>}
+      {saveError && <div className="inline-alert danger" style={{ marginBottom: 18 }}>{saveError}</div>}
+      {loading && <div className="skeleton" />}
 
       {editingProfile ? (
         <div className="card">
-          <div className="form-group">
-            <label>Profile Name</label>
-            <input value={editingProfile.name} onChange={e => setEditingProfile({...editingProfile, name: e.target.value})} />
+          <div className="page-toolbar" style={{ marginBottom: 12 }}>
+            <div><h2 className="page-title">Profile editor</h2><p className="page-subtitle">Set preferred, warning, and critical temperature ranges.</p></div>
+            <span className="badge badge-blue">{ranges.length} components</span>
           </div>
-
-          <table>
-            <thead>
-              <tr><th>Component</th><th>Label</th><th>Min (°C)</th><th>Max (°C)</th><th>Warn Max (°C)</th><th>Crit Max (°C)</th></tr>
-            </thead>
-            <tbody>
-              {ranges.map((r, i) => (
-                <tr key={i}>
-                  <td><span className="badge">{r.component_type}</span></td>
-                  <td><input value={r.component_label || ''} onChange={e => { const nr = [...ranges]; nr[i].component_label = e.target.value; setRanges(nr); }} style={{width: 120}} /></td>
-                  <td><input type="number" value={r.temp_min ?? ''} onChange={e => { const nr = [...ranges]; nr[i].temp_min = parseFloat(e.target.value) || null; setRanges(nr); }} style={{width: 70}} /></td>
-                  <td><input type="number" value={r.temp_max ?? ''} onChange={e => { const nr = [...ranges]; nr[i].temp_max = parseFloat(e.target.value) || null; setRanges(nr); }} style={{width: 70}} /></td>
-                  <td><input type="number" value={r.warning_max ?? ''} onChange={e => { const nr = [...ranges]; nr[i].warning_max = parseFloat(e.target.value) || null; setRanges(nr); }} style={{width: 70}} /></td>
-                  <td><input type="number" value={r.critical_max ?? ''} onChange={e => { const nr = [...ranges]; nr[i].critical_max = parseFloat(e.target.value) || null; setRanges(nr); }} style={{width: 70}} /></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-
-          <div className="form-actions">
-            <button className="btn" onClick={() => setEditingProfile(null)}>Cancel</button>
-            <button className="btn btn-primary" onClick={handleSave}>Save Profile</button>
+          <div className="form-group"><label>Profile Name</label><input value={editingProfile.name} onChange={e => setEditingProfile({...editingProfile, name: e.target.value})} /></div>
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>Component</th><th>Label</th><th>Min °C</th><th>Max °C</th><th>Warn Max °C</th><th>Crit Max °C</th></tr></thead>
+              <tbody>
+                {ranges.map((r, i) => (
+                  <tr key={i}>
+                    <td><span className="badge">{r.component_type}</span></td>
+                    <td><input value={r.component_label || ''} onChange={e => { const nr = [...ranges]; nr[i].component_label = e.target.value; setRanges(nr); }} /></td>
+                    <td><input type="number" value={r.temp_min ?? ''} onChange={e => { const nr = [...ranges]; nr[i].temp_min = parseFloat(e.target.value) || null; setRanges(nr); }} /></td>
+                    <td><input type="number" value={r.temp_max ?? ''} onChange={e => { const nr = [...ranges]; nr[i].temp_max = parseFloat(e.target.value) || null; setRanges(nr); }} /></td>
+                    <td><input type="number" value={r.warning_max ?? ''} onChange={e => { const nr = [...ranges]; nr[i].warning_max = parseFloat(e.target.value) || null; setRanges(nr); }} /></td>
+                    <td><input type="number" value={r.critical_max ?? ''} onChange={e => { const nr = [...ranges]; nr[i].critical_max = parseFloat(e.target.value) || null; setRanges(nr); }} /></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
+          <div className="form-actions"><button className="btn" onClick={() => setEditingProfile(null)}>Cancel</button><button className="btn btn-primary" onClick={handleSave}>Save Profile</button></div>
         </div>
-      ) : (
+      ) : !loading && (
         <div className="grid grid-2">
           {profiles.map(p => (
-            <div key={p.id} className="card">
-              <div style={{display: 'flex', justifyContent: 'space-between', marginBottom: 8}}>
-                <strong>{p.name}</strong>
-                {p.is_default && <span className="badge badge-green">Default</span>}
+            <article key={p.id} className="card server-card online">
+              <div className="server-header"><div><div className="server-name">{p.name}</div><div className="server-meta">{p.ranges.length} component thresholds</div></div>{p.is_default && <span className="badge badge-green">Default</span>}</div>
+              <div className="detail-grid">
+                {p.ranges.slice(0, 4).map((r, i) => <div className="detail-card" key={i}><span className="meta-label">{r.component_type} · {r.component_label || 'sensor'}</span><span className="meta-value mono">{r.temp_min ?? '-'}°C — {r.temp_max ?? '-'}°C</span></div>)}
               </div>
-              <div style={{fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8}}>
-                {p.ranges.length} component thresholds
-              </div>
-              {p.ranges.map((r, i) => (
-                <div key={i} style={{display: 'flex', justifyContent: 'space-between', fontSize: 12, padding: '4px 0', borderBottom: '1px solid var(--border)'}}>
-                  <span>{r.component_type}: {r.component_label || ''}</span>
-                  <span className="mono">{r.temp_min ?? '-'}°C — {r.temp_max ?? '-'}°C</span>
-                </div>
-              ))}
-              <div style={{display: 'flex', gap: 4, marginTop: 12}}>
-                <button className="btn btn-sm" onClick={() => { setEditingProfile(p); setRanges(p.ranges); }}>Edit</button>
-                <button className="btn btn-sm btn-danger" onClick={() => handleDelete(p.id)}>Delete</button>
-              </div>
-            </div>
+              <div className="card-actions"><button className="btn btn-sm" onClick={() => { setEditingProfile(p); setRanges(p.ranges); }}>Edit</button><button className="btn btn-sm btn-danger" onClick={() => handleDelete(p.id)}>Delete</button></div>
+            </article>
           ))}
-          {profiles.length === 0 && !loading && (
-            <div className="empty-state" style={{gridColumn: '1 / -1'}}>
-              <p>No profiles yet — click "+ New Profile" to create one.</p>
-            </div>
-          )}
+          {profiles.length === 0 && <div className="empty-state" style={{ gridColumn: '1 / -1' }}><strong>No profiles yet</strong><p>Create a profile to define thermal thresholds for this server.</p></div>}
         </div>
       )}
     </div>

@@ -7,15 +7,16 @@ stores readings in the database, and publishes via WebSocket.
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional, cast
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dsm.config import settings
 from dsm.database import async_session
+from dsm.fan_control import FanController
 from dsm.idrac_connector import IdracConnector, IdracError
-from dsm.models import FanConfig, Server, ServerStatus, SensorReading
+from dsm.models import FanConfig, FanMode, Server, ServerStatus, SensorReading, TempProfile, TempProfileRange
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,14 @@ class SensorPoller:
         """Initialize the sensor poller."""
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._manual_override_task: Optional[asyncio.Task] = None
         self._connectors: dict = {}  # server_id -> IdracConnector
+        self._last_fan_control_at: dict[int, datetime] = {}
+        # Remember the last fan percentage we successfully commanded per server.
+        # Some iDRAC paths report stale PWM percentages while a manual override is
+        # active, so the next thermal decision needs the commanded target rather
+        # than trusting live telemetry alone.
+        self._last_fan_control_target: dict[int, int] = {}
         self._websocket_clients: list = []  # WebSocket for real-time updates
 
     def add_websocket_client(self, ws):
@@ -59,8 +67,75 @@ class SensorPoller:
                 ip=server.ipmi_ip,
                 username=server.ipmi_user,
                 password=password,
+                drac_version=server.drac_version,
             )
+        else:
+            self._connectors[server.id].set_control_profile_hint(server.drac_version)
         return self._connectors[server.id]
+
+    async def _load_active_profile_ranges(self, session: AsyncSession, server_id: int) -> list[Any]:
+        profile_result = await session.execute(
+            select(TempProfile).where(TempProfile.server_id == server_id, TempProfile.is_default == True)
+        )
+        profile = cast(Any, profile_result.scalars().first())
+        if not profile:
+            return []
+
+        range_result = await session.execute(
+            select(TempProfileRange).where(TempProfileRange.profile_id == profile.id)
+        )
+        return list(range_result.scalars().all())
+
+    @staticmethod
+    def _current_fan_percent_from_inventory(fans: list[Any], fallback: int) -> int:
+        percents = [fan.percent for fan in fans if getattr(fan, "percent", None) is not None]
+        if percents:
+            return int(max(percents))
+        return fallback
+
+    async def _maybe_auto_control_fans(
+        self,
+        session: AsyncSession,
+        server: Server,
+        connector: IdracConnector,
+        sensor_data,
+    ) -> Optional[dict]:
+        result = await session.execute(select(FanConfig).where(FanConfig.server_id == server.id))
+        fan_config = cast(Any, result.scalars().first())
+        if not fan_config or not fan_config.auto_control:
+            return None
+
+        profile_ranges = await self._load_active_profile_ranges(session, server.id)
+        inventory_fan_percent = self._current_fan_percent_from_inventory(sensor_data.fans, fan_config.manual_speed)
+        current_fan_percent = self._last_fan_control_target.get(server.id, inventory_fan_percent)
+        controller = FanController(
+            connector=connector,
+            cpu_temp_min=fan_config.cpu_temp_min,
+            cpu_temp_max=fan_config.cpu_temp_max,
+            disk_temp_min=fan_config.disk_temp_min,
+            disk_temp_max=fan_config.disk_temp_max,
+            fan_min=7,
+            fan_max=100,
+        )
+        controller._mode = FanMode.AUTO.value
+        controller._current_fan_percent = current_fan_percent
+        result = await controller.control_cycle(
+            sensor_data=sensor_data,
+            current_fan_percent=current_fan_percent,
+            profile_ranges=profile_ranges,
+            step_percent=3,
+        )
+        now = datetime.now(timezone.utc)
+        if result.action_taken in {"increased", "decreased"}:
+            self._last_fan_control_at[server.id] = now
+            self._last_fan_control_target[server.id] = result.target_fan_percent
+        return {
+            "target_fan_percent": result.target_fan_percent,
+            "action_taken": result.action_taken,
+            "reason": result.reason,
+            "current_fan_percent": current_fan_percent,
+            "polling_seconds": settings.sensor_poll_interval,
+        }
 
     async def poll_server(self, server: Server) -> dict:
         """Poll a single server and store readings in the database.
@@ -106,6 +181,8 @@ class SensorPoller:
 
                 await session.commit()
 
+                fan_control = await self._maybe_auto_control_fans(session, db_server, connector, sensor_data)
+
                 result = {
                     "status": "ok",
                     "server": db_server.name,
@@ -120,6 +197,7 @@ class SensorPoller:
                         for f in sensor_data.fans
                     ],
                     "power_state": sensor_data.system_info.power_state if sensor_data.system_info else "Unknown",
+                    "fan_control": fan_control,
                 }
 
                 logger.info(f"Polled {db_server.name}: {len(sensor_data.temperatures)} temps, {len(sensor_data.fans)} fans")
@@ -192,12 +270,112 @@ class SensorPoller:
             except asyncio.CancelledError:
                 break
 
+    async def _enforce_manual_overrides_once(self):
+        """Re-apply persisted manual overrides so transient controllers stay pinned.
+
+        Some iDRAC7 paths (notably the R730xd via Dell OEM IPMI) accept an exact
+        manual percentage immediately but let the override decay after ~20–30s
+        unless it is refreshed. Keepalive re-application makes the persisted UI
+        state match the real hardware state until the user switches back to auto.
+        """
+        async with async_session() as session:
+            result = await session.execute(
+                select(Server, FanConfig)
+                .join(FanConfig, FanConfig.server_id == Server.id)
+                .where(
+                    FanConfig.auto_control.is_(False),
+                    FanConfig.mode == FanMode.MANUAL.value,
+                )
+            )
+            rows = result.all()
+
+        for server, config in rows:
+            connector = await self._get_connector(server)
+            if connector is None:
+                continue
+            controller = FanController(connector=connector)
+            success = await controller.set_manual_speed(config.manual_speed)
+            if success:
+                logger.info(
+                    "Re-applied manual fan override for %s at %s%%",
+                    server.name,
+                    config.manual_speed,
+                )
+            else:
+                logger.warning(
+                    "Failed to re-apply manual fan override for %s at %s%%",
+                    server.name,
+                    config.manual_speed,
+                )
+
+    async def _refresh_auto_control_targets_once(self):
+        """Re-assert low-speed auto targets on IPMI-backed iDRAC7 systems.
+
+        Some IPMI fan-control paths accept the requested duty cycle but let it
+        drift upward again if the manual target is not refreshed periodically.
+        When auto control has already decided on a target and cached it in
+        ``_last_fan_control_target``, keep sending that same target on a shorter
+        cadence than the main sensor poll so cool systems can continue easing
+        down toward the configured floor.
+        """
+        async with async_session() as session:
+            result = await session.execute(
+                select(Server, FanConfig)
+                .join(FanConfig, FanConfig.server_id == Server.id)
+                .where(
+                    FanConfig.auto_control.is_(True),
+                    FanConfig.mode == FanMode.AUTO.value,
+                )
+            )
+            rows = result.all()
+
+        for server, config in rows:
+            target = self._last_fan_control_target.get(server.id)
+            if target is None:
+                continue
+            connector = await self._get_connector(server)
+            if connector is None:
+                continue
+            if getattr(connector, "_fan_control_backend", None) != "ipmi":
+                continue
+            controller = FanController(connector=connector, fan_min=7)
+            controller._mode = FanMode.AUTO.value
+            success = await controller._apply_fan_mode("Manual", target)
+            if success:
+                logger.info(
+                    "Refreshed auto fan target for %s at %s%%",
+                    server.name,
+                    target,
+                )
+            else:
+                logger.warning(
+                    "Failed to refresh auto fan target for %s at %s%%",
+                    server.name,
+                    target,
+                )
+
+    async def _manual_override_loop(self):
+        """Background keepalive for persisted manual overrides."""
+        interval_seconds = 15
+        while self._running:
+            try:
+                await self._enforce_manual_overrides_once()
+                await self._refresh_auto_control_targets_once()
+            except Exception as e:
+                logger.error(f"Manual override loop error: {e}")
+
+            try:
+                await asyncio.sleep(interval_seconds)
+            except asyncio.CancelledError:
+                break
+
     async def start(self):
         """Start the polling loop as a background asyncio task."""
         if self._running:
             return
         self._running = True
         self._task = asyncio.create_task(self._poll_loop())
+        self._manual_override_task = asyncio.create_task(self._manual_override_loop())
         logger.info(f"Sensor poller started (interval: {settings.sensor_poll_interval}s)")
 
     async def stop(self):
@@ -210,6 +388,19 @@ class SensorPoller:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        if self._manual_override_task:
+            self._manual_override_task.cancel()
+            try:
+                await self._manual_override_task
+            except asyncio.CancelledError:
+                pass
+            self._manual_override_task = None
+        for connector in self._connectors.values():
+            try:
+                await connector.close()
+            except Exception:
+                pass
+        self._connectors.clear()
         logger.info("Sensor poller stopped")
 
     @staticmethod
@@ -218,8 +409,8 @@ class SensorPoller:
 
         Returns one of: 'cpu', 'disk', 'ambient', 'power_supply', 'other'.
         """
-        name_lower = sensor.name.lower()
-        context = sensor.physical_context.lower()
+        name_lower = (sensor.name or "").lower()
+        context = (sensor.physical_context or "").lower()
 
         if "cpu" in name_lower or context == "cpu":
             return "cpu"

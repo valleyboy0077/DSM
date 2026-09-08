@@ -6,13 +6,16 @@ WebSocket endpoint for real-time push updates from the poller.
 """
 
 from datetime import datetime, timedelta, timezone
+from typing import Any, cast
 
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dsm.auth import get_current_user
+from dsm.crypto import decrypt_ciphertext
 from dsm.database import get_session
+from dsm.idrac_connector import IdracConnector, IdracConnectionError, IdracError
 from dsm.models import SensorReading, Server, User
 from dsm.sensor_poller import SensorPoller
 
@@ -137,7 +140,7 @@ async def get_sensor_summary(
     Fetches the most recent readings (last 5 minutes) and returns
     the latest value per sensor label along with server metadata.
     """
-    server = await session.get(Server, server_id)
+    server = cast(Any, await session.get(Server, server_id))
     if not server:
         raise HTTPException(status_code=404, detail="Server not found")
 
@@ -170,6 +173,79 @@ async def get_sensor_summary(
         "last_seen": server.last_seen.isoformat() if server.last_seen else None,
         "sensors": list(latest.values()),
     }
+
+
+@router.get("/live/{server_id}")
+async def get_live_sensors(
+    server_id: int,
+    _user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Get a live sensor snapshot directly from iDRAC.
+
+    Returns the current temperatures and fan readings from hardware rather than
+    the stored sensor history tables.
+    """
+    server = cast(Any, await session.get(Server, server_id))
+    if not server:
+        raise HTTPException(status_code=404, detail="Server not found")
+
+    password = decrypt_ciphertext(server.ipmi_password_enc)
+    if not password:
+        raise HTTPException(status_code=500, detail="Cannot decrypt credentials")
+
+    connector = IdracConnector(
+        ip=server.ipmi_ip,
+        username=server.ipmi_user,
+        password=password,
+        drac_version=server.drac_version,
+    )
+
+    try:
+        sensor_data = await connector.get_sensors()
+        system = sensor_data.system_info
+        return {
+            "server_id": server.id,
+            "server_name": server.name,
+            "collected_at": datetime.now(timezone.utc).isoformat(),
+            "source": "idrac",
+            "system_info": None
+            if system is None
+            else {
+                "model": system.model,
+                "service_tag": system.service_tag,
+                "bios_version": system.bios_version,
+                "firmware_version": system.firmware_version,
+                "drac_version": system.drac_version,
+                "power_state": system.power_state,
+            },
+            "temperatures": [
+                {
+                    "name": temp.name,
+                    "value_celsius": temp.value_celsius,
+                    "physical_context": temp.physical_context,
+                    "upper_critical": temp.upper_critical,
+                    "upper_warning": temp.upper_warning,
+                }
+                for temp in sensor_data.temperatures
+            ],
+            "fans": [
+                {
+                    "name": fan.name,
+                    "member_id": fan.member_id,
+                    "rpm": fan.rpm,
+                    "percent": fan.percent,
+                    "health": fan.health,
+                }
+                for fan in sensor_data.fans
+            ],
+        }
+    except IdracConnectionError as e:
+        raise HTTPException(status_code=502, detail=f"Cannot connect to iDRAC: {e}")
+    except IdracError as e:
+        raise HTTPException(status_code=502, detail=f"iDRAC sensor query failed: {e}")
+    finally:
+        await connector.close()
 
 
 @router.websocket("/ws/{server_id}")

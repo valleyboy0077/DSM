@@ -106,7 +106,22 @@ async def _propagate_to_idrac(
     password = decrypt_ciphertext(user.password_enc)
     if not password:
         logger.error(f"Cannot decrypt password for user {user.username}")
-        return
+        results = [
+            PropagationResult(
+                server_id=server.id,
+                server_name=server.name,
+                status=PropagationStatus.FAILED.value,
+                error_message="Cannot decrypt DSM user password",
+            )
+            for server in servers
+        ]
+        return PropagationResponse(
+            total=len(results),
+            success=0,
+            failed=len(results),
+            skipped=0,
+            results=results,
+        )
 
     # Map DSM role to iDRAC role
     role_map = {
@@ -119,6 +134,7 @@ async def _propagate_to_idrac(
     results = []
 
     for server in servers:
+        connector: Optional[IdracConnector] = None
         try:
             server_password = decrypt_ciphertext(server.ipmi_password_enc)
             if not server_password:
@@ -136,12 +152,14 @@ async def _propagate_to_idrac(
             )
 
             status = await connector.create_user(user.username, password, drac_role)
+            error_message = None if status == PropagationStatus.SUCCESS.value else "iDRAC user propagation did not complete successfully"
 
             propagation = IdracUserPropagation(
                 user_id=user.id,
                 server_id=server.id,
                 status=status,
                 drac_role=drac_role,
+                error_message=error_message,
             )
             session.add(propagation)
 
@@ -149,10 +167,8 @@ async def _propagate_to_idrac(
                 server_id=server.id,
                 server_name=server.name,
                 status=status,
-                error_message=None,
+                error_message=error_message,
             ))
-
-            await connector.close()
 
         except IdracError as e:
             logger.error(f"Propagation failed for {user.username} on {server.name}: {e}")
@@ -178,6 +194,9 @@ async def _propagate_to_idrac(
                 status=PropagationStatus.FAILED.value,
                 error_message=str(e),
             ))
+        finally:
+            if connector is not None:
+                await connector.close()
 
     await session.commit()
 

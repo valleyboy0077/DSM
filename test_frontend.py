@@ -112,6 +112,8 @@ check("Fan config 200", r.status_code == 200)
 fan = r.json()
 check("Fan mode is 'auto'", fan.get("mode") == "auto")
 check("Fan has server_id", fan.get("server_id") == 1)
+check("Fan polling default is 20", fan.get("polling_seconds") == 20)
+check("Fan config includes current_target_percent", "current_target_percent" in fan)
 
 # Update fan mode
 r = client.put("/fans/1", headers=headers, json={"mode": "manual", "manual_speed": 75})

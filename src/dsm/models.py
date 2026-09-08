@@ -141,7 +141,8 @@ class FanConfig(Base):
     cpu_temp_max = Column(Float, default=70.0)
     disk_temp_min = Column(Float, default=32.0)
     disk_temp_max = Column(Float, default=45.0)
-    manual_speed = Column(Integer, default=50)
+    manual_speed = Column(Integer, default=25)
+    polling_seconds = Column(Integer, default=20)
     auto_control = Column(Boolean, default=True)
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
                         onupdate=lambda: datetime.now(timezone.utc))

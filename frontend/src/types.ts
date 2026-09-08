@@ -3,7 +3,10 @@ export interface Server {
   name: string;
   ipmi_ip: string;
   ipmi_user: string;
-  drac_version: string | null;
+  drac_version: string | null; // legacy/internal DSM control profile
+  controller_profile?: string | null; // preferred alias for the stored profile
+  controller_label?: string | null; // user-facing hardware/controller label
+  controller_source?: string | null;
   model: string | null;
   serial: string | null;
   status: string;
@@ -29,7 +32,9 @@ export interface FanConfig {
   disk_temp_min: number;
   disk_temp_max: number;
   manual_speed: number;
+  polling_seconds: number;
   auto_control: boolean;
+  current_target_percent: number | null;
   updated_at: string | null;
 }
 
@@ -41,6 +46,23 @@ export interface FanControlResult {
   ambient_temp: number;
   action: string;
   reason: string;
+}
+
+export interface FanTelemetryItem {
+  name: string;
+  member_id: string;
+  rpm: number;
+  percent: number | null;
+  health: string;
+  source: string;
+}
+
+export interface FanTelemetryResponse {
+  server_id: number;
+  server_name: string;
+  collected_at: string;
+  source: string;
+  fans: FanTelemetryItem[];
 }
 
 export interface SensorSummary {

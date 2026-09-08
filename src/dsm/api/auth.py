@@ -175,14 +175,12 @@ async def register(data: RegisterRequest, session: AsyncSession = Depends(get_se
 
 
 @router.get("/me", response_model=UserResponse)
-async def get_me(user: User = Depends(get_current_user)):
+async def get_me(
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
     """Get current user info."""
-    roles = await _get_user_roles(get_session.__self__ if hasattr(get_session, '__self__') else None, user)  # type: ignore
-    # Simplified — get roles in the route itself
-    from dsm.database import async_session
-    async with async_session() as s:
-        result = await s.execute(select(Role.name).join(UserRole).where(UserRole.user_id == user.id))
-        roles = [r[0] for r in result.all()]
+    roles = await _get_user_roles(session, user)
     return UserResponse.from_user(user, roles)
 
 

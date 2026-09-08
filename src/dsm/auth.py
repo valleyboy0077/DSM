@@ -174,4 +174,13 @@ async def seed_default_admin(
     )
     session.add(admin)
     await session.commit()
+    await session.refresh(admin)
+
+    # Assign admin role
+    role_result = await session.execute(select(Role).where(Role.name == "admin"))
+    role = role_result.scalars().first()
+    if role:
+        session.add(UserRole(user_id=admin.id, role_id=role.id))
+        await session.commit()
+
     logger.info(f"Default admin user created: {username}")
