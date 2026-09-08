@@ -8,5 +8,5 @@ bcrypt>=4.2
 PyJWT>=2.10
 cryptography>=44.0
 httpx[http2]>=0.28
-mcp>=1.0.0,<2.0.0
+mcp>=1.8.0,<2.0.0
 python-multipart>=0.0.20

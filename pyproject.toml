@@ -17,7 +17,7 @@ dependencies = [
     "schedule>=1.2.0",
     "cryptography>=44.0.0",
     "bcrypt>=4.2.0",
-    "mcp>=1.0.0,<2.0.0",
+    "mcp>=1.8.0,<2.0.0",
     "httpx>=0.28",
 ]
 
