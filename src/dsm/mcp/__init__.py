@@ -19,7 +19,7 @@ Usage (from an AI agent config):
     "command": "python3",
     "args": ["-m", "dsm.mcp.server"],
     "env": {
-      "DSM_API_URL": "http://127.0.0.1:8000",
+      "DSM_API_URL": "http://127.0.0.1:8080",
       "DSM_API_TOKEN": "<jwt_token>"
     }
   }

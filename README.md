@@ -83,7 +83,7 @@ export DSM_ENCRYPTION_KEY='a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4'
 sudo mkdir -p /var/lib/dsm
 
 # 4. Start backend
-uvicorn dsm.app:app --host 0.0.0.0 --port 8000
+uvicorn dsm.app:app --host 0.0.0.0 --port 8080
 
 # 5. Build frontend (separate terminal)
 cd frontend
