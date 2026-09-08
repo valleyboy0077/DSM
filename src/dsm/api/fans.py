@@ -9,12 +9,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dsm.auth import get_current_user, require_operator
-from dsm.crypto import decrypt_ciphertext
 from dsm.database import get_session
 from dsm.fan_control import FanController
-from dsm.api.temp_profiles import get_active_temp_profile_ranges
-from dsm.idrac_connector import IdracConnector, IdracConnectionError, IdracError
+from dsm.api.idrac import execute_idrac_request
+from dsm.idrac_connector import IdracConnector
 from dsm.models import FanConfig, FanMode, Server, User
+from dsm.temp_profile_repository import get_active_temp_profile_ranges
 
 router = APIRouter(prefix="/fans", tags=["fans"])
 
@@ -190,33 +190,21 @@ async def get_fan_telemetry(
     if not server:
         raise HTTPException(status_code=404, detail="Server not found")
 
-    password = decrypt_ciphertext(server.ipmi_password_enc)
-    if not password:
-        raise HTTPException(status_code=500, detail="Cannot decrypt credentials")
-
-    connector = IdracConnector(
-        ip=server.ipmi_ip,
-        username=server.ipmi_user,
-        password=password,
-        drac_version=server.drac_version,
+    fans = await execute_idrac_request(
+        server,
+        lambda connector: connector.get_fan_inventory(),
+        credential_error_detail="Cannot decrypt credentials",
+        connection_error_detail=lambda error: f"Cannot connect to iDRAC: {error}",
+        idrac_error_detail=lambda error: f"iDRAC telemetry query failed: {error}",
     )
-
-    try:
-        fans = await connector.get_fan_inventory()
-        source = fans[0]["source"] if fans else "unknown"
-        return FanTelemetryResponse(
-            server_id=server.id,
-            server_name=server.name,
-            collected_at=datetime.now(timezone.utc),
-            source=source,
-            fans=[FanTelemetryItem(**fan) for fan in fans],
-        )
-    except IdracConnectionError as e:
-        raise HTTPException(status_code=502, detail=f"Cannot connect to iDRAC: {e}")
-    except IdracError as e:
-        raise HTTPException(status_code=502, detail=f"iDRAC telemetry query failed: {e}")
-    finally:
-        await connector.close()
+    source = fans[0]["source"] if fans else "unknown"
+    return FanTelemetryResponse(
+        server_id=server.id,
+        server_name=server.name,
+        collected_at=datetime.now(timezone.utc),
+        source=source,
+        fans=[FanTelemetryItem(**fan) for fan in fans],
+    )
 
 
 @router.put("/{server_id}", response_model=FanConfigResponse)
@@ -274,26 +262,13 @@ async def control_fans(
     if not server:
         raise HTTPException(status_code=404, detail="Server not found")
 
-    password = decrypt_ciphertext(server.ipmi_password_enc)
-    if not password:
-        raise HTTPException(status_code=500, detail="Cannot decrypt credentials")
-
-    # Get the persisted config row so button-triggered state changes are saved.
-    config = await _get_or_create_fan_config(session, server_id)
-
-    cpu_min = config.cpu_temp_min if config else 45.0
-    cpu_max = config.cpu_temp_max if config else 70.0
-    disk_min = config.disk_temp_min if config else 32.0
-    disk_max = config.disk_temp_max if config else 45.0
-
-    connector = IdracConnector(
-        ip=server.ipmi_ip,
-        username=server.ipmi_user,
-        password=password,
-        drac_version=server.drac_version,
-    )
-
-    try:
+    async def execute_control(connector: IdracConnector) -> dict:
+        # Get the persisted config row so button-triggered state changes are saved.
+        config = await _get_or_create_fan_config(session, server_id)
+        cpu_min = config.cpu_temp_min if config else 45.0
+        cpu_max = config.cpu_temp_max if config else 70.0
+        disk_min = config.disk_temp_min if config else 32.0
+        disk_max = config.disk_temp_max if config else 45.0
         controller = FanController(
             connector=connector,
             cpu_temp_min=cpu_min,
@@ -376,7 +351,9 @@ async def control_fans(
                 "reason": result.reason,
             }
 
-    except IdracConnectionError as e:
-        raise HTTPException(status_code=502, detail=f"Cannot connect to iDRAC: {e}")
-    finally:
-        await connector.close()
+    return await execute_idrac_request(
+        server,
+        execute_control,
+        credential_error_detail="Cannot decrypt credentials",
+        connection_error_detail=lambda error: f"Cannot connect to iDRAC: {error}",
+    )

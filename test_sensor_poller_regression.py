@@ -68,7 +68,7 @@ async def test_auto_control_ramps_down_across_cycles_even_when_live_pwm_is_stale
     async def fake_profile_ranges(session, server_id):
         return []
 
-    monkeypatch.setattr(poller, "_load_active_profile_ranges", fake_profile_ranges)
+    monkeypatch.setattr("dsm.sensor_poller.get_active_temp_profile_ranges", fake_profile_ranges)
 
     targets = []
     for _ in range(6):

@@ -16,7 +16,8 @@ from dsm.config import settings
 from dsm.database import async_session
 from dsm.fan_control import FanController
 from dsm.idrac_connector import IdracConnector, IdracError
-from dsm.models import FanConfig, FanMode, Server, ServerStatus, SensorReading, TempProfile, TempProfileRange
+from dsm.models import FanConfig, FanMode, Server, ServerStatus, SensorReading
+from dsm.temp_profile_repository import get_active_temp_profile_ranges
 
 logger = logging.getLogger(__name__)
 
@@ -73,19 +74,6 @@ class SensorPoller:
             self._connectors[server.id].set_control_profile_hint(server.drac_version)
         return self._connectors[server.id]
 
-    async def _load_active_profile_ranges(self, session: AsyncSession, server_id: int) -> list[Any]:
-        profile_result = await session.execute(
-            select(TempProfile).where(TempProfile.server_id == server_id, TempProfile.is_default == True)
-        )
-        profile = cast(Any, profile_result.scalars().first())
-        if not profile:
-            return []
-
-        range_result = await session.execute(
-            select(TempProfileRange).where(TempProfileRange.profile_id == profile.id)
-        )
-        return list(range_result.scalars().all())
-
     @staticmethod
     def _current_fan_percent_from_inventory(fans: list[Any]) -> Optional[int]:
         percents = [
@@ -109,7 +97,7 @@ class SensorPoller:
         if not fan_config or not fan_config.auto_control:
             return None
 
-        profile_ranges = await self._load_active_profile_ranges(session, server.id)
+        profile_ranges = await get_active_temp_profile_ranges(session, server.id)
         inventory_fan_percent = self._current_fan_percent_from_inventory(sensor_data.fans)
         current_fan_percent = self._last_fan_control_target.get(server.id, inventory_fan_percent)
         if current_fan_percent is None:
