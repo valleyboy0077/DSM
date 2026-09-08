@@ -76,11 +76,18 @@ class SensorPoller:
 
     @staticmethod
     def _current_fan_percent_from_inventory(fans: list[Any]) -> Optional[int]:
-        percents = [
-            fan.percent for fan in fans
-            if getattr(fan, "percent", None) is not None
-            and getattr(fan, "percent_source", "pwm") != "rpm_estimate"
-        ]
+        percents = []
+        for fan in fans:
+            percent = getattr(fan, "percent", None)
+            source = getattr(fan, "percent_source", "pwm")
+            if source not in {"pwm", "controller_percentage"}:
+                continue
+            try:
+                percent = int(percent)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= percent <= 100:
+                percents.append(percent)
         if percents:
             return int(max(percents))
         return None
@@ -99,7 +106,26 @@ class SensorPoller:
 
         profile_ranges = await get_active_temp_profile_ranges(session, server.id)
         inventory_fan_percent = self._current_fan_percent_from_inventory(sensor_data.fans)
-        current_fan_percent = self._last_fan_control_target.get(server.id, inventory_fan_percent)
+        # Control from observed iDRAC PWM whenever it is available.  A command
+        # is a request, not proof of the physical duty: iDRAC can clamp it for
+        # thermal policy, fan hardware, or a racadm MinimumFanSpeed floor.  In
+        # particular, stepping from a cached 14% target while the chassis is
+        # actually at 27% can issue a 17% command and never raise airflow.
+        # Keep the last successful target only as a safe compatibility fallback
+        # for controllers that genuinely expose no usable duty telemetry.
+        current_fan_percent = (
+            inventory_fan_percent
+            if inventory_fan_percent is not None
+            else self._last_fan_control_target.get(server.id)
+        )
+        # The iDRAC7 IPMI keepalive uses this cache independently of the main
+        # polling cadence.  Refresh it from a usable controller observation
+        # before evaluating the thermal rule, including when that rule holds
+        # the current duty, so it cannot re-apply an obsolete prior command.
+        # Do not overwrite the last known target when telemetry is absent or
+        # merely an RPM-derived estimate: that value remains the safe fallback.
+        if inventory_fan_percent is not None:
+            self._last_fan_control_target[server.id] = inventory_fan_percent
         if current_fan_percent is None:
             logger.warning(
                 "Skipping DSM fan adjustment for %s: no reported PWM and no prior commanded target",
@@ -202,11 +228,13 @@ class SensorPoller:
                 return result
 
             except IdracError as e:
+                await session.rollback()
                 db_server.status = ServerStatus.DEGRADED.value
                 await session.commit()
                 logger.warning(f"Poll error for {db_server.name}: {e}")
                 return {"status": "error", "server": db_server.name, "error": str(e)}
             except Exception as e:
+                await session.rollback()
                 db_server.status = ServerStatus.OFFLINE.value
                 await session.commit()
                 logger.error(f"Unexpected error polling {db_server.name}: {e}")

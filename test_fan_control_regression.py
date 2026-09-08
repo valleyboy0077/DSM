@@ -1,5 +1,9 @@
-import pytest
+import json
+import os
+import xml.etree.ElementTree as ET
 from types import SimpleNamespace
+
+import pytest
 
 from dsm.api import fans as fans_api
 from dsm.fan_control import FanController
@@ -30,6 +34,58 @@ class FakeConnector:
         if self.ipmi_success:
             self._fan_control_backend = "ipmi"
         return self.ipmi_success
+
+
+@pytest.mark.asyncio
+async def test_ipmi_subprocess_requests_operator_privilege(monkeypatch, tmp_path):
+    """The isolated pyghmi request must authenticate at operator privilege."""
+    pyghmi_module = tmp_path / "pyghmi" / "ipmi"
+    pyghmi_module.mkdir(parents=True)
+    (tmp_path / "pyghmi" / "__init__.py").write_text("")
+    (pyghmi_module / "__init__.py").write_text("")
+    (pyghmi_module / "command.py").write_text(
+        """
+import json
+import os
+
+
+def _record(event):
+    with open(os.environ["PYGHMI_TEST_LOG"], "a", encoding="utf-8") as log:
+        log.write(json.dumps(event) + "\\n")
+
+
+class _Session:
+    def logout(self):
+        _record({"event": "logout"})
+
+
+class Command:
+    def __init__(self, **kwargs):
+        self.ipmi_session = _Session()
+        _record({"event": "command", "privlevel": kwargs.get("privlevel")})
+
+    def raw_command(self, **kwargs):
+        _record({"event": "raw", "netfn": kwargs["netfn"], "command": kwargs["command"], "data": kwargs["data"]})
+        return {"code": 0}
+""".lstrip(),
+        encoding="utf-8",
+    )
+    log_path = tmp_path / "pyghmi-events.jsonl"
+    existing_pythonpath = os.environ.get("PYTHONPATH", "")
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path) + (os.pathsep + existing_pythonpath if existing_pythonpath else ""))
+    monkeypatch.setenv("PYGHMI_TEST_LOG", str(log_path))
+    monkeypatch.setattr("dsm.idrac_connector.pyghmi_command", object())
+
+    connector = IdracConnector(ip="127.0.0.1", username="operator", password="test-only")
+
+    assert await connector.set_fan_mode_ipmi("Manual", 25) is True
+
+    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert events[0] == {"event": "command", "privlevel": 4}
+    assert events[1:3] == [
+        {"event": "raw", "netfn": 0x30, "command": 0x30, "data": [0x01, 0x00]},
+        {"event": "raw", "netfn": 0x30, "command": 0x30, "data": [0x02, 0xFF, 25]},
+    ]
 
 
 @pytest.mark.asyncio
@@ -150,6 +206,101 @@ async def test_redfish_rpm_percentage_estimate_is_explicitly_marked_in_telemetry
 
     assert payload['percent'] == 50
     assert payload['percent_source'] == 'rpm_estimate'
+
+
+@pytest.mark.asyncio
+async def test_sensor_snapshot_prefers_wsman_pwm_for_automatic_control(monkeypatch):
+    connector = IdracConnector(ip='10.0.0.1', username='user', password='password')
+
+    async def redfish_thermal(_path):
+        return {
+            'Temperatures': [
+                {'Name': 'CPU1 Temp', 'ReadingCelsius': 75, 'PhysicalContext': 'CPU'},
+            ],
+            'Fans': [
+                {'Name': 'Fan 1', 'Reading': 3840, 'MemberId': 'Fan1'},
+            ],
+        }
+
+    async def wsman_inventory():
+        return [{
+            'name': 'Fan 1',
+            'member_id': 'Fan1',
+            'rpm': 5760,
+            'percent': 27,
+            'percent_source': 'pwm',
+            'health': 'OK',
+            'source': 'wsman',
+        }]
+
+    async def detect_version():
+        return None
+
+    monkeypatch.setattr(connector, '_request', redfish_thermal)
+    monkeypatch.setattr(connector, 'get_fan_inventory', wsman_inventory)
+    monkeypatch.setattr(connector, 'detect_version', detect_version)
+
+    snapshot = await connector.get_sensors()
+
+    assert [(fan.rpm, fan.percent, fan.percent_source) for fan in snapshot.fans] == [(5760, 27, 'pwm')]
+
+
+@pytest.mark.asyncio
+async def test_malformed_wsman_fan_inventory_keeps_redfish_sensor_data_usable(monkeypatch):
+    connector = IdracConnector(ip='10.0.0.1', username='user', password='password')
+
+    async def malformed_wsman_inventory(_class_name):
+        raise ET.ParseError('malformed WS-Man inventory')
+
+    async def redfish_thermal(_path):
+        return {
+            'Temperatures': [{'Name': 'CPU1 Temp', 'ReadingCelsius': 75, 'PhysicalContext': 'CPU'}],
+            'Fans': [{'Name': 'Fan 1', 'MemberId': 'Fan1', 'Reading': 5760, 'MaxReadingRange': 12000}],
+        }
+
+    async def detect_version():
+        return None
+
+    monkeypatch.setattr(connector, '_wsman_enumerate', malformed_wsman_inventory)
+    monkeypatch.setattr(connector, '_request', redfish_thermal)
+    monkeypatch.setattr(connector, 'detect_version', detect_version)
+
+    snapshot = await connector.get_sensors()
+
+    assert [temp.value_celsius for temp in snapshot.temperatures] == [75]
+    assert [(fan.member_id, fan.rpm, fan.percent_source) for fan in snapshot.fans] == [
+        ('Fan1', 5760, 'rpm_estimate'),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_incomplete_wsman_inventory_merges_with_redfish_by_fan_identity(monkeypatch):
+    connector = IdracConnector(ip='10.0.0.1', username='user', password='password')
+
+    async def wsman_inventory(_class_name):
+        return [{
+            'DeviceDescription': 'Fan 1',
+            'FQDD': 'Fan.Embedded.1',
+            'CurrentReading': '0',
+            'PWM': '27',
+            'PrimaryStatus': '1',
+        }]
+
+    async def redfish_thermal(_path):
+        return {'Fans': [
+            {'Name': 'Fan 1', 'MemberId': 'Fan1', 'Reading': 5760, 'MaxReadingRange': 12000},
+            {'Name': 'Fan 2', 'MemberId': 'Fan2', 'Reading': 4800, 'MaxReadingRange': 12000},
+        ]}
+
+    monkeypatch.setattr(connector, '_wsman_enumerate', wsman_inventory)
+    monkeypatch.setattr(connector, '_request', redfish_thermal)
+
+    fans = await connector.get_fan_inventory()
+
+    assert [(fan['member_id'], fan['rpm'], fan['percent'], fan['percent_source']) for fan in fans] == [
+        ('Fan1', 5760, 27, 'pwm'),
+        ('Fan2', 4800, 40, 'rpm_estimate'),
+    ]
 
 
 @pytest.mark.asyncio
