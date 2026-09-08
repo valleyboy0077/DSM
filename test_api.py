@@ -73,6 +73,7 @@ r = client.get(f"/fans/{server_id}", headers=headers)
 check("Get fan config", r.status_code == 200)
 fan_mode = r.json().get("mode", "")
 check("Fan mode default is auto", fan_mode == "auto")
+check("Fan polling default is 20", r.json().get("polling_seconds") == 20)
 
 # 10. Update fan config
 r = client.put(f"/fans/{server_id}", json={
@@ -99,7 +100,7 @@ check("List users", r.status_code == 200 and len(r.json()) >= 1)
 r = client.get("/groups/", headers=headers)
 check("List groups", r.status_code == 200)
 
-# 15. Users create
+# 15. Users create (no propagation — just DSM DB)
 r = client.post("/users/", json={
     "username": "operator1",
     "password": "oper123456",
@@ -110,6 +111,38 @@ r = client.post("/users/", json={
 if r.status_code != 201:
     print(f"  DEBUG create user: {r.status_code} {r.text[:200]}")
 check("Create operator user", r.status_code == 201)
+
+# 16. Propagate operator1 to iDRAC and verify privilege fields
+r = client.post("/users/1/propagate", headers=headers)
+if r.status_code != 200:
+    print(f"  DEBUG propagate: {r.status_code} {r.text[:200]}")
+check("Propagate operator1", r.status_code == 200)
+prop_data = r.json()
+check("Propagation has results", len(prop_data.get("results", [])) > 0)
+if prop_data.get("results"):
+    first_result = prop_data["results"][0]
+    check("Propagation status is success", first_result.get("status") == "success")
+    # Now verify the privilege fields are set on the iDRAC
+    r = client.get(f"/settings/idrac-users/{server_id}", headers=headers)
+    if r.status_code == 200:
+        idrac_users = r.json()
+        operator1_found = None
+        for u in idrac_users:
+            if u.get("username") == "operator1":
+                operator1_found = u
+                break
+        if operator1_found:
+            check("operator1 has LAN privilege set", operator1_found.get("lan_privilege") == "Operator")
+            check("operator1 has Serial privilege set", operator1_found.get("serial_privilege") == "Operator")
+            check("operator1 has Access set", operator1_found.get("access") == "Operator")
+            check("operator1 has RoleId set", operator1_found.get("role") == "501")
+            check("operator1 has Privileges array", len(operator1_found.get("privileges", [])) > 0)
+        else:
+            check("operator1 found in iDRAC users", False)
+            print(f"  DEBUG iDRAC users: {json.dumps(idrac_users, indent=2)}")
+    else:
+        print(f"  DEBUG list iDRAC users: {r.status_code} {r.text[:200]}")
+        check("List iDRAC users", False)
 
 # 16. Delete server
 r = client.delete(f"/servers/{server_id}", headers=headers)

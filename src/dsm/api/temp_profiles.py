@@ -2,7 +2,7 @@
 
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional, cast
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -16,6 +16,21 @@ from dsm.models import TempProfile, TempProfileRange, FanConfig, Server, User
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/temp-profiles", tags=["temp-profiles"])
+
+
+async def get_active_temp_profile_ranges(session: AsyncSession, server_id: int) -> list[TempProfileRange]:
+    """Return the active/default thermal profile ranges for a server."""
+    profile_result = await session.execute(
+        select(TempProfile).where(TempProfile.server_id == server_id, TempProfile.is_default == True)
+    )
+    profile = cast(Any, profile_result.scalars().first())
+    if not profile:
+        return []
+
+    range_result = await session.execute(
+        select(TempProfileRange).where(TempProfileRange.profile_id == profile.id)
+    )
+    return list(range_result.scalars().all())
 
 
 class TempRangeCreate(BaseModel):
@@ -133,10 +148,21 @@ async def create_profile(
         ))
     await session.commit()
 
+    # Load ranges for response
+    ranges_result = await session.execute(
+        select(TempProfileRange).where(TempProfileRange.profile_id == profile.id)
+    )
+    saved_ranges = ranges_result.scalars().all()
+
     return TempProfileResponse(
         id=profile.id, server_id=profile.server_id, server_name=server.name,
         is_default=profile.is_default, name=profile.name,
-        ranges=[],
+        ranges=[TempRangeResponse(
+            id=r.id, component_type=r.component_type, component_label=r.component_label,
+            temp_min=r.temp_min, temp_max=r.temp_max,
+            warning_min=r.warning_min, warning_max=r.warning_max,
+            critical_min=r.critical_min, critical_max=r.critical_max,
+        ) for r in saved_ranges],
         created_at=profile.created_at.isoformat() if profile.created_at else None,
     )
 
@@ -182,11 +208,20 @@ async def update_profile(
     await session.commit()
 
     server = await session.get(Server, profile.server_id)
+    ranges_result = await session.execute(
+        select(TempProfileRange).where(TempProfileRange.profile_id == profile.id)
+    )
+    saved_ranges = ranges_result.scalars().all()
 
     return TempProfileResponse(
         id=profile.id, server_id=profile.server_id, server_name=server.name if server else None,
         is_default=profile.is_default, name=profile.name,
-        ranges=[],
+        ranges=[TempRangeResponse(
+            id=r.id, component_type=r.component_type, component_label=r.component_label,
+            temp_min=r.temp_min, temp_max=r.temp_max,
+            warning_min=r.warning_min, warning_max=r.warning_max,
+            critical_min=r.critical_min, critical_max=r.critical_max,
+        ) for r in saved_ranges],
         updated_at=profile.updated_at.isoformat() if profile.updated_at else None,
     )
 
@@ -228,7 +263,7 @@ async def get_effective_thresholds(
     profile_result = await session.execute(
         select(TempProfile).where(TempProfile.server_id == server_id, TempProfile.is_default == True)
     )
-    profile = profile_result.scalars().first()
+    profile = cast(Any, profile_result.scalars().first())
 
     ranges = {}
     if profile:
@@ -254,6 +289,7 @@ async def get_effective_thresholds(
             "cpu_temp_max": fan_config.cpu_temp_max if fan_config else 70.0,
             "disk_temp_min": fan_config.disk_temp_min if fan_config else 32.0,
             "disk_temp_max": fan_config.disk_temp_max if fan_config else 45.0,
+            "polling_seconds": fan_config.polling_seconds if fan_config else 20,
         },
         "profile": profile.name if profile else None,
         "ranges": ranges,

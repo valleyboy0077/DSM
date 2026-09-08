@@ -121,7 +121,9 @@ app.include_router(settings_router)
 # ─── Frontend ────────────────────────────────────────────────────────────────
 frontend_dir = os.path.join(os.path.dirname(__file__), "frontend")
 if os.path.isdir(frontend_dir):
-    app.mount("/static", StaticFiles(directory=frontend_dir), name="static")
+    assets_dir = os.path.join(frontend_dir, "assets")
+    if os.path.isdir(assets_dir):
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
     index_path = os.path.join(frontend_dir, "index.html")
 
@@ -129,20 +131,25 @@ if os.path.isdir(frontend_dir):
     async def serve_frontend():
         from fastapi.responses import FileResponse
         if os.path.exists(index_path):
-            return FileResponse(index_path)
+            # Avoid stale SPA shells after rebuilding the frontend during live DSM
+            # debugging. The hashed JS assets can change while the browser still
+            # holds an older index.html that points at previous bundles.
+            return FileResponse(index_path, headers={"Cache-Control": "no-store, max-age=0"})
         return {"error": "Frontend not built."}
 
     # Catch-all for SPA client-side routing
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
         """Serve the React SPA for all non-API routes."""
-        # Don't interfere with API routes
+        # Don't interfere with API routes or bundled frontend assets
         if full_path.startswith(("auth/", "servers/", "sensors/", "fans/",
                                  "users/", "groups/", "temp-profiles/",
-                                 "settings/", "health", "info")):
+                                 "settings/", "health", "info", "assets/")):
             from fastapi import HTTPException
             raise HTTPException(status_code=404)
         from fastapi.responses import FileResponse
         if os.path.exists(index_path):
-            return FileResponse(index_path)
+            # Same no-store rationale as `/`: always serve the latest SPA shell
+            # for client-side routes after a rebuild.
+            return FileResponse(index_path, headers={"Cache-Control": "no-store, max-age=0"})
         return {"error": "Frontend not built."}
