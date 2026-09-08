@@ -14,10 +14,9 @@ Implemented and tested.
 The MCP server is started from the DSM app lifespan and is available at:
 
 - Streamable HTTP: `http://127.0.0.1:8101/mcp`
-- SSE helper endpoint: `http://127.0.0.1:8101/sse` for low-level MCP clients
 
 For Hermes CLI integration, use the streamable HTTP endpoint (`/mcp`).
-The CLI `hermes mcp add` flow expects streamable HTTP, and testing `/sse` directly can yield a `405 Method Not Allowed` during connection checks.
+The CLI `hermes mcp add` flow expects streamable HTTP.
 
 ## Runtime configuration
 

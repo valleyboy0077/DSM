@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-from dsm.idrac_connector import IdracConnector, IdracError, TempSensor, FanSensor
+from dsm.idrac_connector import IdracConnector, IdracError, TempSensor
 from dsm.models import FanMode
 
 logger = logging.getLogger(__name__)

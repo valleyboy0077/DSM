@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Test iDRAC7 user creation with string RoleId."""
 import httpx
-import json
 
 client = httpx.Client(
     base_url="https://10.1.1.109",

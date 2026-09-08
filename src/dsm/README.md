@@ -42,6 +42,6 @@ All settings via `DSM_` prefixed env vars or `.env` file:
 DSM_SENSOR_POLL_INTERVAL=3
 DSM_DB_PATH=/var/lib/dsm/dsm.db
 DSM_ENCRYPTION_KEY=abcdef1234567890...  # 32 hex chars
-DSM_PORT=8100
+DSM_PORT=8000
 DSM_DEBUG=true
 ```

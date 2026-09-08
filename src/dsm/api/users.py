@@ -1,6 +1,5 @@
 """User management API — CRUD + iDRAC user propagation."""
 
-import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -10,7 +9,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from dsm.auth import hash_password, get_current_user, require_admin, seed_default_roles
+from dsm.auth import hash_password, require_admin, seed_default_roles
 from dsm.crypto import encrypt_plaintext, decrypt_ciphertext
 from dsm.database import get_session
 from dsm.idrac_connector import IdracConnector, IdracError

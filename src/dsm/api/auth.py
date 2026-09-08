@@ -14,11 +14,9 @@ from dsm.auth import (
     verify_password,
     create_token,
     get_current_user,
-    decode_token,
     seed_default_roles,
     seed_default_admin,
 )
-from dsm.config import settings
 from dsm.crypto import encrypt_plaintext
 from dsm.database import get_session
 from dsm.models import User, Role, UserRole

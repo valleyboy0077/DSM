@@ -33,6 +33,8 @@ mcp = FastMCP(
         "Unified out-of-band management for Dell PowerEdge servers via iDRAC. "
         "Query hardware data, monitor temperatures, control fans, manage servers."
     ),
+    host="0.0.0.0",
+    port=settings.mcp_port,
 )
 
 # ─── HTTP helper ────────────────────────────────────────────────────────
@@ -400,10 +402,10 @@ async def server_summary(server_id: int) -> str:
 
 
 def main():
-    """Run the MCP server via SSE transport."""
+    """Run the MCP server via streamable HTTP transport."""
     mcp_port = settings.mcp_port
     logger.info(f"Starting DSM MCP server on port {mcp_port}")
-    mcp.run("sse", host="0.0.0.0", port=mcp_port)
+    mcp.run("streamable-http")
 
 
 if __name__ == "__main__":

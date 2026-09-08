@@ -10,12 +10,10 @@ New in v2:
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional
 
 from sqlalchemy import (
     Boolean,
     Column,
-    Enum as SAEnum,
     Float,
     ForeignKey,
     Integer,
@@ -51,12 +49,6 @@ class FanMode(str, Enum):
     AUTO = "auto"
     MANUAL = "manual"
     PROFILE = "profile"
-
-
-class UserRole(str, Enum):
-    ADMIN = "admin"
-    OPERATOR = "operator"
-    VIEWER = "viewer"
 
 
 class TempComponentType(str, Enum):
