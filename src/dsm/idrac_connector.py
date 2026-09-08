@@ -279,7 +279,14 @@ class IdracConnector:
             )
 
     async def get_sensors(self) -> IdracSensorData:
-        """Get all temperature and fan sensor readings."""
+        """Get all temperature and fan sensor readings.
+
+        Redfish is the primary source for temperatures, but its older Dell
+        implementations frequently omit the fan PWM that DCIM_FanView exposes.
+        The automatic controller must use observed controller duty as its
+        feedback value, so prefer the same WS-Man-backed inventory used by the
+        live telemetry endpoint when it is available.
+        """
         data = IdracSensorData()
 
         try:
@@ -314,6 +321,30 @@ class IdracConnector:
                 )
                 data.fans.append(fan_sensor)
 
+            # Do not let an absent or incomplete Redfish PWM reading make the
+            # automatic loop fall back to a prior command.  WS-Man fan
+            # inventory is the authoritative available PWM source on the
+            # affected iDRAC7 compatibility profile.  Preserve the Redfish
+            # readings if the supplementary inventory query is unavailable.
+            try:
+                inventory = await self.get_fan_inventory()
+            except (IdracError, IdracConnectionError) as exc:
+                logger.info("Keeping Redfish fan readings for %s: %s", self.ip, exc)
+            else:
+                inventory_fans = [
+                    FanSensor(
+                        name=fan["name"],
+                        rpm=fan["rpm"],
+                        member_id=fan["member_id"],
+                        percent=fan["percent"],
+                        percent_source=fan["percent_source"],
+                        health=fan["health"],
+                    )
+                    for fan in inventory
+                ]
+                if inventory_fans:
+                    data.fans = inventory_fans
+
             # Get system info if not already cached
             if not data.system_info:
                 data.system_info = await self.detect_version()
@@ -327,15 +358,16 @@ class IdracConnector:
         """Get live fan RPM + percentage readings.
 
         Prefer WS-Man/DCIM_FanView because older iDRAC generations expose PWM
-        percentages there more reliably than Redfish. Fall back to Redfish
-        thermal data when WS-Man fan inventory is unavailable.
+        percentages there more reliably than Redfish. Merge it with Redfish
+        by fan identity so a partial WS-Man response cannot hide otherwise
+        valid Redfish readings.
         """
+        wsman_fans: list[dict] = []
         try:
             fan_rows = await self._wsman_enumerate("DCIM_FanView")
-            parsed = []
             for row in fan_rows:
                 percent = self._coerce_int(row.get("PWM"))
-                parsed.append({
+                wsman_fans.append({
                     "name": row.get("DeviceDescription") or row.get("FQDD") or row.get("InstanceID") or "Fan",
                     "member_id": row.get("FQDD") or row.get("InstanceID") or "",
                     "rpm": self._coerce_int(row.get("CurrentReading")) or 0,
@@ -344,14 +376,14 @@ class IdracConnector:
                     "health": self._status_label(row.get("PrimaryStatus")),
                     "source": "wsman",
                 })
-            parsed = [fan for fan in parsed if fan["rpm"] > 0 or fan["percent"] is not None]
-            if parsed:
-                return parsed
-        except (IdracError, IdracConnectionError) as exc:
+            wsman_fans = [fan for fan in wsman_fans if fan["rpm"] > 0 or fan["percent"] is not None]
+        except (IdracError, IdracConnectionError, ET.ParseError, TypeError, AttributeError) as exc:
+            # A malformed/partial SOAP payload is inventory-local.  Redfish
+            # thermal telemetry is still useful and must remain available.
             logger.info(f"Falling back to Redfish fan telemetry for {self.ip}: {exc}")
 
         thermal = await self._request("/redfish/v1/Chassis/System.Embedded.1/Thermal/")
-        parsed = []
+        redfish_fans = []
         for fan in thermal.get("Fans", []):
             reading = self._coerce_int(fan.get("Reading")) or 0
             percent = self._coerce_int(fan.get("Oem", {}).get("Dell", {}).get("PWM"))
@@ -364,7 +396,7 @@ class IdracConnector:
                 if upper and upper > 0 and reading > 0:
                     percent = max(1, min(100, round((reading / upper) * 100)))
                     percent_source = "rpm_estimate"
-            parsed.append({
+            redfish_fans.append({
                 "name": fan.get("FanName") or fan.get("Name") or "Fan",
                 "member_id": fan.get("MemberId") or fan.get("Id") or "",
                 "rpm": reading,
@@ -373,7 +405,44 @@ class IdracConnector:
                 "health": fan.get("Status", {}).get("Health", "Unknown"),
                 "source": "redfish",
             })
-        return parsed
+        return self._merge_fan_inventory(redfish_fans, wsman_fans)
+
+    @staticmethod
+    def _fan_inventory_identity(fan: dict) -> str:
+        """Return a stable fan identity across Redfish and DCIM inventory."""
+        value = fan.get("member_id") or fan.get("name") or ""
+        normalized = "".join(character for character in str(value).lower() if character.isalnum())
+        # DCIM often calls a fan ``Fan.Embedded.1`` while Redfish uses
+        # ``Fan1``.  Removing this transport-specific label aligns them.
+        return normalized.replace("embedded", "")
+
+    @classmethod
+    def _merge_fan_inventory(cls, redfish_fans: list[dict], wsman_fans: list[dict]) -> list[dict]:
+        """Overlay usable WS-Man values without dropping Redfish-only fans."""
+        merged = [dict(fan) for fan in redfish_fans]
+        redfish_indexes = {
+            cls._fan_inventory_identity(fan): index
+            for index, fan in enumerate(merged)
+            if cls._fan_inventory_identity(fan)
+        }
+
+        for wsman_fan in wsman_fans:
+            index = redfish_indexes.get(cls._fan_inventory_identity(wsman_fan))
+            if index is None:
+                merged.append(dict(wsman_fan))
+                continue
+
+            fan = merged[index]
+            if wsman_fan["rpm"] > 0:
+                fan["rpm"] = wsman_fan["rpm"]
+            if wsman_fan["percent"] is not None:
+                fan["percent"] = wsman_fan["percent"]
+                fan["percent_source"] = wsman_fan["percent_source"]
+                fan["source"] = "wsman"
+            if wsman_fan["health"] not in {"", "Unknown"}:
+                fan["health"] = wsman_fan["health"]
+
+        return merged
 
     async def get_power_state(self) -> str:
         """Get current power state of the server."""
@@ -446,7 +515,7 @@ class IdracConnector:
 import sys
 from pyghmi.ipmi import command as pyghmi_command
 ip, username, password, mode, speed = sys.argv[1:6]
-ipmi = pyghmi_command.Command(bmc=ip, userid=username, password=password)
+ipmi = pyghmi_command.Command(bmc=ip, userid=username, password=password, privlevel=4)
 try:
     if mode == "Manual":
         pct = max(1, min(100, int(speed)))
@@ -534,8 +603,9 @@ finally:
         """Set fan control via racadm thermal settings.
 
         This is an iDRAC7 fallback for systems where Dell OEM IPMI fan control
-        is unavailable to the configured account. It is slower than IPMI, but
-        live testing showed it works reliably on the R530 path.
+        is unavailable to the configured account.  Its ``MinimumFanSpeed``
+        setting is a minimum floor, not an exact manual PWM duty; iDRAC may
+        operate the fans above the requested value.
         """
         try:
             if mode == "Manual" and speed_percent is not None:
@@ -544,7 +614,7 @@ finally:
                     ["set", "system.thermalsettings.MinimumFanSpeed", str(clamped)],
                     timeout=120,
                 )
-                logger.info(f"racadm manual fan speed applied on {self.ip}: {clamped}%")
+                logger.info(f"racadm minimum fan-speed floor applied on {self.ip}: {clamped}%")
             else:
                 # On boxes where racadm MinimumFanSpeed overrides are supported,
                 # 255 is the automatic/default sentinel.

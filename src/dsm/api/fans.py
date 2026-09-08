@@ -294,7 +294,17 @@ async def control_fans(
                 auto_control=False,
                 manual_speed=controller._current_fan_percent,
             )
-            return {"status": "ok", "message": f"Fan speed set to {controller._current_fan_percent}%"}
+            if getattr(connector, "_fan_control_backend", None) == "racadm":
+                message = (
+                    f"RACADM minimum fan-speed floor set to {controller._current_fan_percent}%; "
+                    "iDRAC may run the fans higher"
+                )
+            else:
+                message = (
+                    f"Manual fan duty command sent at {controller._current_fan_percent}%; "
+                    "confirm effective PWM and RPM in live telemetry"
+                )
+            return {"status": "ok", "message": message}
 
         elif action.action == "set_auto":
             success = await controller.set_auto_mode()
