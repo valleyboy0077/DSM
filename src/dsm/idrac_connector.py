@@ -515,7 +515,7 @@ class IdracConnector:
 import sys
 from pyghmi.ipmi import command as pyghmi_command
 ip, username, password, mode, speed = sys.argv[1:6]
-ipmi = pyghmi_command.Command(bmc=ip, userid=username, password=password, privlevel=4)
+ipmi = pyghmi_command.Command(bmc=ip, userid=username, password=password, privlevel=2)
 try:
     if mode == "Manual":
         pct = max(1, min(100, int(speed)))
