@@ -53,6 +53,7 @@ export interface FanTelemetryItem {
   member_id: string;
   rpm: number;
   percent: number | null;
+  percent_source: 'pwm' | 'controller_percentage' | 'rpm_estimate' | 'unavailable';
   health: string;
   source: string;
 }

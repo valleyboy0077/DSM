@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import type { CSSProperties } from 'react';
 import { useParams } from 'react-router-dom';
 import { api } from '../api';
 import type { FanConfig, FanTelemetryItem, FanTelemetryResponse, Server } from '../types';
@@ -26,6 +27,12 @@ function formatRpm(value: number): string {
   return value > 0 ? `${value.toLocaleString()} RPM` : '—';
 }
 
+function fanPercentLabel(fan: FanTelemetryItem): string {
+  if (fan.percent_source === 'rpm_estimate') return 'RPM estimate';
+  if (fan.percent_source === 'controller_percentage') return 'Reported %';
+  return 'PWM';
+}
+
 const DEFAULT_POLLING_SECONDS = 20;
 
 function fanHealthClass(health: string): string {
@@ -34,10 +41,10 @@ function fanHealthClass(health: string): string {
   return 'warning';
 }
 
-function fanGlowClass(fan: FanTelemetryItem, percentOverride?: number | null): string {
+function fanGlowClass(fan: FanTelemetryItem): string {
   if (fan.health === 'Critical') return 'fan-glow-critical';
   if (fan.health !== 'OK') return 'fan-glow-warning';
-  const percent = percentOverride ?? fan.percent ?? 0;
+  const percent = fan.percent ?? 0;
   if (percent >= 35) return 'fan-glow-fast';
   if (percent >= 20) return 'fan-glow-medium';
   return 'fan-glow-low';
@@ -95,13 +102,8 @@ export default function FanControl() {
   const [telemetryError, setTelemetryError] = useState<string | null>(null);
   const [manualSpeed, setManualSpeed] = useState(25);
   const fanSummary = summarizeFans(telemetry?.fans ?? []);
-  const pwmCanBeStale = telemetry?.source === 'wsman';
-  const effectiveTargetPercent = config?.current_target_percent ?? null;
-  const targetOverridesTelemetry = pwmCanBeStale && effectiveTargetPercent != null;
-  const manualTargetOverridesTelemetry = pwmCanBeStale && config?.mode === 'manual' && !config?.auto_control;
-  const displayedAveragePercent = targetOverridesTelemetry ? effectiveTargetPercent : manualTargetOverridesTelemetry ? (config?.manual_speed ?? null) : fanSummary.avgPercent;
-  const displayedPeakPercent = targetOverridesTelemetry ? effectiveTargetPercent : manualTargetOverridesTelemetry ? (config?.manual_speed ?? null) : fanSummary.highestPercent;
   const pollingSeconds = config?.polling_seconds ?? DEFAULT_POLLING_SECONDS;
+  const manualCommandActive = config?.mode === 'manual' && !config.auto_control;
 
   const fetchData = useCallback(async () => {
     setTelemetryLoading(true);
@@ -174,6 +176,7 @@ export default function FanControl() {
       <div className="grid grid-4" style={{ marginBottom: 18 }}>
         <div className="card metric-card"><div className="card-title">Mode</div><div className="card-value" style={{ fontSize: 28 }}>{config?.mode || '—'}</div><div className="card-subtitle">Current control policy</div></div>
         <div className="card metric-card"><div className="card-title">Manual target</div><div className="card-value">{config?.manual_speed ?? manualSpeed}%</div><div className="card-subtitle">Stored fan override</div></div>
+        <div className="card metric-card"><div className="card-title">{manualCommandActive ? 'Manual command' : 'DSM auto target'}</div><div className="card-value">{formatPercent(manualCommandActive ? (config?.current_target_percent ?? config?.manual_speed ?? null) : (config?.current_target_percent ?? null))}</div><div className="card-subtitle">{manualCommandActive ? 'Last manual duty command' : 'Last target commanded by automatic control'}</div></div>
         <div className="card metric-card"><div className="card-title">Auto control</div><div className="card-value" style={{ fontSize: 28, color: config?.auto_control ? 'var(--green)' : 'var(--yellow)' }}>{config?.auto_control ? 'ON' : 'OFF'}</div><div className="card-subtitle">Backend control loop</div></div>
         <div className="card metric-card"><div className="card-title">Polling</div><div className="card-value">{pollingSeconds}s</div><div className="card-subtitle">Control loop interval</div></div>
         <div className="card metric-card"><div className="card-title">Detected fans</div><div className="card-value">{telemetry?.fans.length ?? 0}</div><div className="card-subtitle">Live chassis fan inventory</div></div>
@@ -184,7 +187,7 @@ export default function FanControl() {
           <div>
             <div className="card-title">Live fan telemetry</div>
             <p style={{ margin: '6px 0 0', color: 'var(--text-secondary)' }}>
-              Showing each detected chassis fan with live RPM plus percentage duty. WS-Man/DCIM is preferred when the controller exposes PWM directly.
+              Showing each detected chassis fan with live RPM and controller-reported duty where available. Otherwise, the displayed percentage is an RPM-derived estimate.
             </p>
           </div>
           <div className="hardware-section-meta">
@@ -194,9 +197,14 @@ export default function FanControl() {
 
         {telemetryLoading && <div className="inline-alert">Loading live fan telemetry…</div>}
         {!telemetryLoading && telemetryError && <div className="inline-alert danger">Unable to load live fan telemetry: {telemetryError}</div>}
-        {!telemetryLoading && pwmCanBeStale && (
+        {!telemetryLoading && telemetry?.source === 'wsman' && (
           <div className="inline-alert warning" style={{ marginBottom: 12 }}>
-            This WS-Man telemetry path can report a stale PWM percentage. DSM will prefer the active control target when it knows one, and live RPM movement remains the best confirmation of real fan behavior.
+            WS-Man may report a stale PWM percentage. PWM below is always the controller-reported value; compare it with the requested target and confirm changes with live RPM.
+          </div>
+        )}
+        {!telemetryLoading && telemetry?.fans.some((fan) => fan.percent_source === 'rpm_estimate') && (
+          <div className="inline-alert warning" style={{ marginBottom: 12 }}>
+            RPM-derived percentages are display estimates, not controller duty, and DSM does not use them for automatic fan control.
           </div>
         )}
 
@@ -204,9 +212,9 @@ export default function FanControl() {
           <>
             <div className="fan-summary-grid">
               <div className="fan-summary-card">
-                <span className="meta-label">Average PWM</span>
-                <strong>{formatPercent(displayedAveragePercent)}</strong>
-                <span className="card-subtitle">Across all detected fans</span>
+                <span className="meta-label">Average displayed %</span>
+                <strong>{formatPercent(fanSummary.avgPercent)}</strong>
+                <span className="card-subtitle">See each fan for PWM, reported %, or estimate</span>
               </div>
               <div className="fan-summary-card">
                 <span className="meta-label">Average RPM</span>
@@ -219,9 +227,9 @@ export default function FanControl() {
                 <span className="card-subtitle">Lowest to highest live RPM</span>
               </div>
               <div className="fan-summary-card">
-                <span className="meta-label">Peak PWM</span>
-                <strong>{formatPercent(displayedPeakPercent)}</strong>
-                <span className="card-subtitle">Fastest fan right now</span>
+                <span className="meta-label">Peak displayed %</span>
+                <strong>{formatPercent(fanSummary.highestPercent)}</strong>
+                <span className="card-subtitle">Highest displayed fan percentage</span>
               </div>
             </div>
 
@@ -229,9 +237,9 @@ export default function FanControl() {
               {telemetry.fans.map((fan, index) => {
                 const slotLabel = deriveFanSlotLabel(fan, index);
                 const slotNumber = extractFanSlotNumber(fan, index);
-                const displayPercent = targetOverridesTelemetry ? (effectiveTargetPercent ?? fan.percent) : manualTargetOverridesTelemetry ? (config?.manual_speed ?? fan.percent) : fan.percent;
-                const spinDuration = fanSpinDuration(displayPercent ?? null);
-                const glowClass = fanGlowClass(fan, displayPercent ?? null);
+                const displayPercent = fan.percent;
+                const spinDuration = fanSpinDuration(displayPercent);
+                const glowClass = fanGlowClass(fan);
                 return (
                   <div className={`fan-slot-card ${glowClass}`} key={fan.member_id || fan.name}>
                     <div className="fan-slot-card-header">
@@ -245,7 +253,7 @@ export default function FanControl() {
                     <div className="fan-slot-subtitle">{fan.name}</div>
 
                     <div className="fan-case-frame">
-                      <div className="fan-photo-graphic" style={{ ['--fan-spin-duration' as '--fan-spin-duration']: spinDuration }}>
+                      <div className="fan-photo-graphic" style={{ '--fan-spin-duration': spinDuration } as CSSProperties}>
                         <svg viewBox="0 0 160 160" className="fan-photo-svg" aria-hidden="true" focusable="false">
                           <defs>
                             <radialGradient id="fanHubGlow" cx="50%" cy="42%" r="70%">
@@ -331,7 +339,7 @@ export default function FanControl() {
 
                     <div className="fan-slot-metrics">
                       <div className="fan-metric-box">
-                        <span className="meta-label">PWM</span>
+                        <span className="meta-label">{fanPercentLabel(fan)}</span>
                         <strong>{formatPercent(displayPercent ?? null)}</strong>
                       </div>
                       <div className="fan-metric-box">

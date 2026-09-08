@@ -87,11 +87,15 @@ class SensorPoller:
         return list(range_result.scalars().all())
 
     @staticmethod
-    def _current_fan_percent_from_inventory(fans: list[Any], fallback: int) -> int:
-        percents = [fan.percent for fan in fans if getattr(fan, "percent", None) is not None]
+    def _current_fan_percent_from_inventory(fans: list[Any]) -> Optional[int]:
+        percents = [
+            fan.percent for fan in fans
+            if getattr(fan, "percent", None) is not None
+            and getattr(fan, "percent_source", "pwm") != "rpm_estimate"
+        ]
         if percents:
             return int(max(percents))
-        return fallback
+        return None
 
     async def _maybe_auto_control_fans(
         self,
@@ -106,8 +110,14 @@ class SensorPoller:
             return None
 
         profile_ranges = await self._load_active_profile_ranges(session, server.id)
-        inventory_fan_percent = self._current_fan_percent_from_inventory(sensor_data.fans, fan_config.manual_speed)
+        inventory_fan_percent = self._current_fan_percent_from_inventory(sensor_data.fans)
         current_fan_percent = self._last_fan_control_target.get(server.id, inventory_fan_percent)
+        if current_fan_percent is None:
+            logger.warning(
+                "Skipping DSM fan adjustment for %s: no reported PWM and no prior commanded target",
+                server.name,
+            )
+            return None
         controller = FanController(
             connector=connector,
             cpu_temp_min=fan_config.cpu_temp_min,
