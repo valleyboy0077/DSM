@@ -371,6 +371,7 @@ code, .mono { font-family: var(--font-mono); font-size: 0.91em; letter-spacing: 
   text-transform: uppercase;
   letter-spacing: .06em;
 }
+.telemetry-error { color: var(--yellow); text-transform: none; letter-spacing: normal; }
 .default-telemetry-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));

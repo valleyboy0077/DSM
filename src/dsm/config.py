@@ -46,6 +46,8 @@ class Settings(BaseSettings):
 
     # Sensor polling interval in seconds (default: 3 seconds for near-real-time monitoring)
     sensor_poll_interval: int = Field(default=3, ge=1, le=3600)
+    # Avoid opening an iDRAC connection for every registered server at once.
+    sensor_poll_concurrency: int = Field(default=4, ge=1, le=64)
 
     # Fan control evaluation interval in seconds
     fan_control_interval: int = Field(default=10, ge=1, le=3600)

@@ -79,6 +79,50 @@ export interface SensorSummary {
   }>;
 }
 
+/** Where the dashboard obtained the currently displayed telemetry. */
+export type TelemetrySource = 'memory' | 'database' | 'unavailable';
+
+/**
+ * Freshness metadata that travels with every dashboard telemetry block.
+ * `captured_at` is null only when no successful telemetry is available.
+ */
+export interface TelemetryFreshness {
+  source: TelemetrySource;
+  captured_at: string | null;
+  age_seconds: number | null;
+  stale: boolean;
+  last_error: string | null;
+  last_attempt_at: string | null;
+}
+
+/** A single server's cache-first dashboard telemetry payload. */
+export interface DashboardServerSnapshot {
+  server_id: number;
+  server_name: string;
+  status: string;
+  revision: number;
+  cycle_id: number;
+  freshness: TelemetryFreshness;
+  readings: SensorSummary['sensors'];
+  fans: FanTelemetryItem[];
+}
+
+/** Lifecycle metadata for the poll cycle that produced dashboard telemetry. */
+export interface PollCycleStatus {
+  cycle_id: number;
+  status: 'idle' | 'running' | 'completed' | 'failed';
+  started_at: string | null;
+  completed_at: string | null;
+  duration_ms: number | null;
+  next_poll_at: string | null;
+}
+
+/** Complete cache-first payload used to hydrate the dashboard. */
+export interface DashboardSnapshot {
+  servers: DashboardServerSnapshot[];
+  poll_cycle: PollCycleStatus;
+}
+
 export interface User {
   id: number;
   username: string;

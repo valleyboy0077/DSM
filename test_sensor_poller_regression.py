@@ -1,3 +1,4 @@
+import asyncio
 import types
 from datetime import datetime, timedelta, timezone
 
@@ -51,6 +52,237 @@ class FakeMonotonicClock:
 
     def __call__(self):
         return self.value
+
+
+class PollServerSession:
+    def __init__(self, servers):
+        self.servers = servers
+
+    async def execute(self, _query):
+        return types.SimpleNamespace(scalars=lambda: types.SimpleNamespace(all=lambda: self.servers))
+
+
+class PollServerSessionContext:
+    def __init__(self, servers):
+        self.session = PollServerSession(servers)
+
+    async def __aenter__(self):
+        return self.session
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+@pytest.mark.asyncio
+async def test_poll_all_caches_normalized_snapshot_and_broadcasts_versioned_event(monkeypatch):
+    poller = SensorPoller()
+    server = types.SimpleNamespace(id=1, name="R730xd")
+    monkeypatch.setattr("dsm.sensor_poller.async_session", lambda: PollServerSessionContext([server]))
+
+    async def poll_one(_server):
+        return {
+            "status": "ok", "server": "R730xd", "server_id": 1,
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "temperatures": [{"name": "CPU1 Temp", "type": "cpu", "value": 52.5}],
+            "fans": [{"name": "Fan 1", "member_id": "Fan1", "rpm": 5400, "percent": 27,
+                      "percent_source": "pwm", "health": "OK"}],
+        }
+
+    events = []
+    async def record_event(event):
+        events.append(event)
+
+    monkeypatch.setattr(poller, "poll_server", poll_one)
+    monkeypatch.setattr(poller, "_broadcast", record_event)
+
+    await poller.poll_all()
+
+    snapshot = poller.get_cached_snapshot(1)
+    assert snapshot["revision"] == 1
+    assert snapshot["freshness"]["source"] == "memory"
+    assert snapshot["readings"] == [{"label": "CPU1 Temp", "type": "cpu", "value": 52.5,
+                                      "timestamp": "2026-01-01T00:00:00+00:00"}]
+    assert snapshot["fans"][0]["percent_source"] == "pwm"
+    assert events[0]["event"] == "server.telemetry.updated"
+    assert events[0]["cycle_id"] == snapshot["cycle_id"]
+    assert events[0]["revision"] == snapshot["revision"]
+    assert events[0]["data"]["server_id"] == snapshot["server_id"]
+    assert events[0]["data"]["readings"] == snapshot["readings"]
+    assert events[0]["data"]["fans"] == snapshot["fans"]
+    assert events[0]["data"]["freshness"]["captured_at"] == snapshot["freshness"]["captured_at"]
+    assert events[1]["event"] == "poll.cycle.completed"
+    assert events[1]["data"]["cycle_id"] == snapshot["cycle_id"]
+
+
+@pytest.mark.asyncio
+async def test_failed_poll_preserves_last_good_normalized_snapshot(monkeypatch):
+    poller = SensorPoller()
+    server = types.SimpleNamespace(id=1, name="R730xd")
+    monkeypatch.setattr("dsm.sensor_poller.async_session", lambda: PollServerSessionContext([server]))
+    outcomes = [
+        {"status": "ok", "server": "R730xd", "server_id": 1,
+         "timestamp": "2026-01-01T00:00:00+00:00",
+         "temperatures": [{"name": "CPU1 Temp", "type": "cpu", "value": 52}], "fans": []},
+        {"status": "error", "server": "R730xd", "server_id": 1, "error": "iDRAC timed out"},
+    ]
+
+    async def poll_one(_server):
+        return outcomes.pop(0)
+
+    monkeypatch.setattr(poller, "poll_server", poll_one)
+    await poller.poll_all()
+    await poller.poll_all()
+
+    snapshot = poller.get_cached_snapshot(1)
+    assert snapshot["revision"] == 2
+    assert snapshot["readings"][0]["value"] == 52
+    assert snapshot["freshness"]["stale"] is True
+    assert snapshot["freshness"]["last_error"] == "iDRAC timed out"
+
+
+@pytest.mark.asyncio
+async def test_poll_all_bounds_concurrency_and_serializes_cycles(monkeypatch):
+    poller = SensorPoller()
+    servers = [types.SimpleNamespace(id=index, name=f"server-{index}") for index in range(1, 5)]
+    monkeypatch.setattr("dsm.sensor_poller.async_session", lambda: PollServerSessionContext(servers))
+    monkeypatch.setattr("dsm.sensor_poller.settings.sensor_poll_concurrency", 2)
+    active = 0
+    peak = 0
+
+    async def poll_one(server):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0)
+        active -= 1
+        return {"status": "ok", "server": server.name, "server_id": server.id,
+                "timestamp": "2026-01-01T00:00:00+00:00", "temperatures": [], "fans": []}
+
+    monkeypatch.setattr(poller, "poll_server", poll_one)
+    await asyncio.gather(poller.poll_all(), poller.poll_all())
+
+    assert peak == 2
+    assert poller.get_dashboard_snapshot()["poll_cycle"]["cycle_id"] == 2
+
+
+@pytest.mark.asyncio
+async def test_poll_all_cancellation_cleans_up_tasks_and_skips_completed_event(monkeypatch):
+    poller = SensorPoller()
+    servers = [types.SimpleNamespace(id=index, name=f"server-{index}") for index in range(1, 3)]
+    monkeypatch.setattr("dsm.sensor_poller.async_session", lambda: PollServerSessionContext(servers))
+    monkeypatch.setattr("dsm.sensor_poller.settings.sensor_poll_concurrency", 2)
+    started = asyncio.Event()
+    cancelled = []
+    active = 0
+    events = []
+
+    async def poll_one(_server):
+        nonlocal active
+        active += 1
+        if active == len(servers):
+            started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.append(_server.id)
+            raise
+
+    async def record_event(event):
+        events.append(event)
+
+    monkeypatch.setattr(poller, "poll_server", poll_one)
+    monkeypatch.setattr(poller, "_broadcast", record_event)
+
+    cycle = asyncio.create_task(poller.poll_all())
+    await started.wait()
+    cycle.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await cycle
+
+    assert sorted(cancelled) == [1, 2]
+    assert poller.get_dashboard_snapshot()["poll_cycle"]["status"] == "cancelled"
+    assert not any(event["event"] == "poll.cycle.completed" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_uses_monotonic_max_interval_or_duration_cadence(monkeypatch):
+    clock = FakeMonotonicClock()
+    poller = SensorPoller(monotonic_clock=clock)
+    poller._running = True
+    sleeps = []
+
+    async def poll_once():
+        clock.value += 5  # longer than the configured interval
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        poller._running = False
+
+    monkeypatch.setattr(poller, "poll_all", poll_once)
+    monkeypatch.setattr("dsm.sensor_poller.settings.sensor_poll_interval", 3)
+    monkeypatch.setattr("dsm.sensor_poller.asyncio.sleep", fake_sleep)
+
+    await poller._poll_loop()
+
+    assert sleeps == [0.0]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_events_only_reach_the_subscribed_server():
+    poller = SensorPoller()
+
+    class Socket:
+        def __init__(self):
+            self.messages = []
+
+        async def send_text(self, message):
+            self.messages.append(message)
+
+    matching = Socket()
+    other = Socket()
+    dashboard = Socket()
+    poller.add_websocket_client(matching, server_id=1)
+    poller.add_websocket_client(other, server_id=2)
+    poller.add_dashboard_websocket_client(dashboard)
+
+    await poller._broadcast_snapshot(
+        {"server_id": 1, "revision": 4, "freshness": {}, "readings": [], "fans": []}, cycle_id=9
+    )
+
+    assert len(matching.messages) == 1
+    assert other.messages == []
+    assert len(dashboard.messages) == 1
+
+    await poller._broadcast({"event": "poll.cycle.completed", "cycle_id": 9, "data": {}})
+    assert len(matching.messages) == 1
+    assert other.messages == []
+    assert len(dashboard.messages) == 2
+
+
+@pytest.mark.asyncio
+async def test_broadcast_deduplicates_recipients_and_removes_dead_client_from_all_streams():
+    poller = SensorPoller()
+
+    class DeadSocket:
+        def __init__(self):
+            self.send_attempts = 0
+
+        async def send_text(self, _message):
+            self.send_attempts += 1
+            raise RuntimeError("disconnected")
+
+    dead = DeadSocket()
+    poller.add_dashboard_websocket_client(dead)
+    poller.add_websocket_client(dead, server_id=1)
+
+    await poller._broadcast_snapshot(
+        {"server_id": 1, "revision": 4, "freshness": {}, "readings": [], "fans": []}, cycle_id=9
+    )
+
+    assert dead.send_attempts == 1
+    assert poller._dashboard_websocket_clients == []
+    assert poller._server_websocket_clients == {}
 
 
 @pytest.mark.asyncio
