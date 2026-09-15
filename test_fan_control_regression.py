@@ -101,15 +101,84 @@ async def test_idrac7_prefers_ipmi_backend_for_new_servers():
 
 
 @pytest.mark.asyncio
-async def test_idrac7_refuses_inexact_racadm_fallback_when_ipmi_is_unauthorized():
+async def test_idrac7_manual_override_falls_back_to_racadm_when_ipmi_is_unauthorized():
+    """The supported iDRAC7 profile must not turn a usable RACADM override into a 500."""
     connector = FakeConnector(drac_version='idrac7', racadm_success=True, ipmi_success=False)
     controller = FanController(connector=connector, fan_min=7)
 
     ok = await controller.set_manual_speed(25)
 
-    assert ok is False
-    assert connector.calls == [('ipmi', 'Manual', 25)]
-    assert getattr(connector, '_fan_control_backend', None) is None
+    assert ok is True
+    assert connector.calls == [('ipmi', 'Manual', 25), ('racadm', 'Manual', 25)]
+    assert getattr(connector, '_fan_control_backend', None) == 'racadm'
+
+
+@pytest.mark.asyncio
+async def test_manual_control_endpoint_succeeds_via_idrac7_racadm_fallback(monkeypatch):
+    """Regression: an IPMI authorization failure must not become the generic manual-speed 500."""
+    server = SimpleNamespace(id=1)
+    config = SimpleNamespace(
+        server_id=1,
+        mode='auto',
+        cpu_temp_min=45.0,
+        cpu_temp_max=70.0,
+        disk_temp_min=32.0,
+        disk_temp_max=45.0,
+        manual_speed=25,
+        polling_seconds=20,
+        auto_control=True,
+    )
+    connector = FakeConnector(drac_version='idrac7', racadm_success=True, ipmi_success=False)
+
+    class FakeResult:
+        def scalars(self):
+            return self
+
+        def first(self):
+            return config
+
+    class FakeSession:
+        async def get(self, model, pk):
+            assert model is fans_api.Server and pk == 1
+            return server
+
+        async def execute(self, query):
+            return FakeResult()
+
+        async def commit(self):
+            return None
+
+        async def refresh(self, obj):
+            return None
+
+    async def fake_execute_idrac_request(_server, operation, **_kwargs):
+        return await operation(connector)
+
+    async def fake_get_active_temp_profile_ranges(_session, _server_id):
+        return []
+
+    monkeypatch.setattr(fans_api, 'execute_idrac_request', fake_execute_idrac_request)
+    monkeypatch.setattr(fans_api, 'get_active_temp_profile_ranges', fake_get_active_temp_profile_ranges)
+    monkeypatch.setattr(
+        'dsm.api.sensors.poller',
+        SimpleNamespace(_last_fan_control_target={}, _last_fan_control_at={}),
+    )
+
+    result = await fans_api.control_fans(
+        server_id=1,
+        action=fans_api.FanControlAction(action='set_manual', speed=25),
+        _user=SimpleNamespace(),
+        session=FakeSession(),
+    )  # type: ignore[arg-type]
+
+    assert result == {
+        'status': 'ok',
+        'message': 'RACADM minimum fan-speed floor set to 25%; iDRAC may run the fans higher',
+    }
+    assert connector.calls == [('ipmi', 'Manual', 25), ('racadm', 'Manual', 25)]
+    assert config.mode == 'manual'
+    assert config.auto_control is False
+    assert config.manual_speed == 25
 
 
 @pytest.mark.asyncio
