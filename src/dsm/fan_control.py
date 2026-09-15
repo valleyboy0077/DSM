@@ -168,7 +168,7 @@ class FanController:
         categorized: dict,
         current_fan_percent: int,
         profile_ranges: Optional[list] = None,
-        step_percent: int = 3,
+        step_percent: Optional[int] = 3,
         temperature_rates: Optional[Mapping[str, float]] = None,
     ) -> tuple[int, str]:
         """Return a bounded P+D correction from current temperatures and rates.
@@ -176,8 +176,9 @@ class FanController:
         The asymmetric loop deliberately raises faster than it falls.  It only
         cools down once every controlled sensor is safely below its lower band,
         and it holds in the deadband so a stable workload does not hunt.
-        ``step_percent`` remains accepted for API compatibility; tuning governs
-        the actual bounded slew limits.
+        Tuning provides the absolute slew limits.  ``step_percent`` is an
+        optional tighter per-cycle cap retained for callers that need a more
+        conservative response.
         """
         current_fan_percent = max(self.fan_min, min(self.fan_max, current_fan_percent))
         rates = temperature_rates or {}
@@ -213,6 +214,8 @@ class FanController:
         if heating:
             correction, name, temp, maximum, rate = max(heating, key=lambda item: item[0])
             change = min(self.tuning.max_rise_step_percent, correction)
+            if step_percent is not None:
+                change = min(change, max(0, int(step_percent)))
             target = min(self.fan_max, current_fan_percent + change)
             return target, (
                 f"{name} {temp:.1f}°C (max {maximum:.1f}°C, rate {rate:+.3f}°C/s); "
@@ -227,6 +230,8 @@ class FanController:
             name, temp, minimum, rate = min(cooling, key=lambda item: item[1])
             correction = max(1, round(self.tuning.fall_gain_percent_per_c * (minimum - temp)))
             change = min(self.tuning.max_fall_step_percent, correction)
+            if step_percent is not None:
+                change = min(change, max(0, int(step_percent)))
             target = max(self.fan_min, current_fan_percent - change)
             return target, (
                 f"{name} {temp:.1f}°C (min {minimum:.1f}°C, rate {rate:+.3f}°C/s); "
@@ -288,7 +293,7 @@ class FanController:
         sensor_data=None,
         current_fan_percent: Optional[int] = None,
         profile_ranges: Optional[list] = None,
-        step_percent: int = 3,
+        step_percent: Optional[int] = 3,
         temperature_rates: Optional[Mapping[str, float]] = None,
         apply: bool = True,
     ) -> FanControlResult:
