@@ -6,9 +6,10 @@ stores readings in the database, and publishes via WebSocket.
 
 import asyncio
 import logging
+import time
 from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Optional, cast
+from typing import Any, Callable, Optional, cast
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,7 +31,7 @@ class SensorPoller:
     servers, fetches sensor data from each iDRAC, and stores readings.
     """
 
-    def __init__(self):
+    def __init__(self, monotonic_clock: Callable[[], float] = time.monotonic):
         """Initialize the sensor poller."""
         self._running = False
         self._task: Optional[asyncio.Task] = None
@@ -38,13 +39,16 @@ class SensorPoller:
         self._connectors: dict = {}  # server_id -> IdracConnector
         self._last_fan_control_at: dict[int, datetime] = {}
         self._last_auto_refresh_at: dict[int, datetime] = {}
-        # Last two timestamped readings per server, keyed by physical sensor.
-        self._temperature_history: dict[int, deque[tuple[datetime, dict[str, float]]]] = {}
-        # Remember the last fan percentage we successfully commanded per server.
-        # Some iDRAC paths report stale PWM percentages while a manual override is
-        # active, so the next thermal decision needs the commanded target rather
-        # than trusting live telemetry alone.
+        self._monotonic_clock = monotonic_clock
+        # Last two monotonic-time readings per server, keyed by physical sensor.
+        self._temperature_history: dict[int, deque[tuple[float, dict[str, float]]]] = {}
+        # Last fan percentage successfully commanded per server.  This is the
+        # automatic control baseline once present; telemetry is not an
+        # acknowledgement and can lag a manual command.
         self._last_fan_control_target: dict[int, int] = {}
+        # Latest usable controller-reported duty, retained separately from the
+        # command target for telemetry and diagnostics.
+        self._last_observed_fan_percent: dict[int, int] = {}
         self._websocket_clients: list = []  # WebSocket for real-time updates
 
     def add_websocket_client(self, ws):
@@ -109,24 +113,36 @@ class SensorPoller:
             max_fall_step_percent=settings.fan_control_max_fall_step_percent,
         )
 
-    def _temperature_rates(self, server_id: int, temperatures: list[Any], now: datetime) -> dict[str, float]:
-        """Calculate per-sensor °C/s from timestamped server-local history."""
+    def _temperature_rates(
+        self,
+        server_id: int,
+        temperatures: list[Any],
+        now: Optional[datetime] = None,
+        monotonic_now: Optional[float] = None,
+    ) -> dict[str, float]:
+        """Calculate per-sensor °C/s from monotonic server-local history.
+
+        ``now`` remains accepted for caller compatibility (and is still used
+        by the command-dwell path); derivative elapsed time deliberately comes
+        from a monotonic clock.
+        """
         current = {
             FanController.sensor_key(sensor): float(sensor.value_celsius)
             for sensor in temperatures
             if FanController._classify_temp(sensor) in {"cpu", "disk"}
         }
+        sample_at = self._monotonic_clock() if monotonic_now is None else monotonic_now
         history = self._temperature_history.setdefault(server_id, deque(maxlen=2))
         rates: dict[str, float] = {}
         if history:
             previous_at, previous = history[-1]
-            elapsed = (now - previous_at).total_seconds()
-            if elapsed > 0:
+            elapsed = sample_at - previous_at
+            if 0 < elapsed <= settings.fan_control_max_temperature_sample_gap_seconds:
                 rates = {
                     key: (value - previous[key]) / elapsed
                     for key, value in current.items() if key in previous
                 }
-        history.append((now, current))
+        history.append((sample_at, current))
         return rates
 
     async def _maybe_auto_control_fans(
@@ -146,26 +162,16 @@ class SensorPoller:
         profile_ranges = await get_active_temp_profile_ranges(session, server.id)
         temperature_rates = self._temperature_rates(server.id, sensor_data.temperatures, now)
         inventory_fan_percent = self._current_fan_percent_from_inventory(sensor_data.fans)
-        # Control from observed iDRAC PWM whenever it is available.  A command
-        # is a request, not proof of the physical duty: iDRAC can clamp it for
-        # thermal policy, fan hardware, or a racadm MinimumFanSpeed floor.  In
-        # particular, stepping from a cached 14% target while the chassis is
-        # actually at 27% can issue a 17% command and never raise airflow.
-        # Keep the last successful target only as a safe compatibility fallback
-        # for controllers that genuinely expose no usable duty telemetry.
-        current_fan_percent = (
-            inventory_fan_percent
-            if inventory_fan_percent is not None
-            else self._last_fan_control_target.get(server.id)
-        )
-        # The iDRAC7 IPMI keepalive uses this cache independently of the main
-        # polling cadence.  Refresh it from a usable controller observation
-        # before evaluating the thermal rule, including when that rule holds
-        # the current duty, so it cannot re-apply an obsolete prior command.
-        # Do not overwrite the last known target when telemetry is absent or
-        # merely an RPM-derived estimate: that value remains the safe fallback.
         if inventory_fan_percent is not None:
-            self._last_fan_control_target[server.id] = inventory_fan_percent
+            self._last_observed_fan_percent[server.id] = inventory_fan_percent
+        # A successful command is the control baseline until it is replaced by
+        # another successful command.  iDRAC PWM telemetry may be stale while
+        # a manual target is taking effect, and must not regress the next rise.
+        current_fan_percent = (
+            self._last_fan_control_target.get(server.id)
+            if server.id in self._last_fan_control_target
+            else inventory_fan_percent
+        )
         if current_fan_percent is None:
             logger.warning(
                 "Skipping DSM fan adjustment for %s: no reported PWM and no prior commanded target",

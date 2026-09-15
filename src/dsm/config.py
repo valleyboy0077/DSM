@@ -59,6 +59,9 @@ class Settings(BaseSettings):
     fan_control_max_rise_step_percent: int = 12
     fan_control_max_fall_step_percent: int = 3
     fan_control_min_command_interval_seconds: int = 15
+    # Ignore a derivative after a polling outage rather than treating a large
+    # elapsed interval as a weak but current thermal trend.
+    fan_control_max_temperature_sample_gap_seconds: int = 120
     fan_control_idrac7_refresh_interval_seconds: int = 60
 
     # Default temperature ranges for fan control (°C)

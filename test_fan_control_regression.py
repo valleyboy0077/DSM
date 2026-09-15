@@ -406,6 +406,20 @@ async def test_incremental_fan_logic_holds_when_mixed_sensors_are_cool_and_in_ra
     assert connector.calls == []
 
 
+def test_step_percent_caps_rise_and_fall_in_addition_to_tuning_limits():
+    controller = FanController(FakeConnector(), cpu_temp_min=40.0, cpu_temp_max=70.0)
+    hot = {"cpu": [TempSensor(name="CPU1 Temp", value_celsius=90.0, physical_context="CPU")], "disk": []}
+    cool = {"cpu": [TempSensor(name="CPU1 Temp", value_celsius=20.0, physical_context="CPU")], "disk": []}
+
+    rise_target, _ = controller._incremental_fan_logic(hot, 20, step_percent=2)
+    fall_target, _ = controller._incremental_fan_logic(cool, 30, step_percent=1)
+    uncapped_rise_target, _ = controller._incremental_fan_logic(hot, 20, step_percent=None)
+
+    assert rise_target == 22
+    assert fall_target == 29
+    assert uncapped_rise_target == 32
+
+
 @pytest.mark.asyncio
 async def test_run_cycle_does_not_treat_saved_manual_speed_as_live_pwm(monkeypatch):
     fake_server = SimpleNamespace(
