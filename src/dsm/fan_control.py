@@ -6,6 +6,7 @@ version-appropriate control path.
 """
 
 import logging
+import math
 import re
 from dataclasses import dataclass
 from typing import Mapping, Optional
@@ -39,6 +40,45 @@ class FanControlTuning:
     rate_deadband_c_per_sec: float = 0.05
     max_rise_step_percent: int = 12
     max_fall_step_percent: int = 3
+
+    def bounded(self, fan_min: int, fan_max: int) -> "FanControlTuning":
+        """Return fail-safe tuning values for a controller's fan range.
+
+        Settings validates environment values, but controllers are also used
+        directly by the API and tests.  Treat a malformed direct tuning object
+        as conservative zero/limited tuning rather than allowing it to create
+        a negative correction or an out-of-range target.
+        """
+        span = max(0, fan_max - fan_min)
+
+        def non_negative(value: object, default: float) -> float:
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                return default
+            if not math.isfinite(parsed):
+                return default
+            return max(0.0, min(100.0, parsed))
+
+        def step(value: object, default: int) -> int:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError, OverflowError):
+                return min(span, default)
+            return max(0, min(span, parsed))
+
+        return FanControlTuning(
+            rise_gain_percent_per_c=non_negative(self.rise_gain_percent_per_c, 0.0),
+            rise_rate_gain_percent_per_c_per_sec=non_negative(
+                self.rise_rate_gain_percent_per_c_per_sec, 0.0
+            ),
+            fall_gain_percent_per_c=non_negative(self.fall_gain_percent_per_c, 0.0),
+            rise_activation_margin_c=non_negative(self.rise_activation_margin_c, 0.0),
+            temp_deadband_c=non_negative(self.temp_deadband_c, 0.0),
+            rate_deadband_c_per_sec=non_negative(self.rate_deadband_c_per_sec, 0.0),
+            max_rise_step_percent=step(self.max_rise_step_percent, 0),
+            max_fall_step_percent=step(self.max_fall_step_percent, 0),
+        )
 
 
 class FanController:
@@ -75,13 +115,17 @@ class FanController:
         self.cpu_temp_max = cpu_temp_max
         self.disk_temp_min = disk_temp_min
         self.disk_temp_max = disk_temp_max
-        self.fan_min = fan_min
-        self.fan_max = fan_max
-        self.tuning = tuning or FanControlTuning()
+        self.fan_min = max(0, min(100, int(fan_min)))
+        self.fan_max = max(self.fan_min, min(100, int(fan_max)))
+        self.tuning = (tuning or FanControlTuning()).bounded(self.fan_min, self.fan_max)
 
         # State
-        self._current_fan_percent: int = fan_min
+        self._current_fan_percent: int = self.fan_min
         self._mode: str = FanMode.AUTO.value
+
+    def _clamp_fan_percent(self, value: int) -> int:
+        """Constrain automatic targets to this controller's configured range."""
+        return max(self.fan_min, min(self.fan_max, int(value)))
 
     @staticmethod
     def _classify_temp(sensor: TempSensor) -> str:
@@ -180,7 +224,7 @@ class FanController:
         optional tighter per-cycle cap retained for callers that need a more
         conservative response.
         """
-        current_fan_percent = max(self.fan_min, min(self.fan_max, current_fan_percent))
+        current_fan_percent = self._clamp_fan_percent(current_fan_percent)
         rates = temperature_rates or {}
         heating = []
         cooling = []
@@ -216,7 +260,7 @@ class FanController:
             change = min(self.tuning.max_rise_step_percent, correction)
             if step_percent is not None:
                 change = min(change, max(0, int(step_percent)))
-            target = min(self.fan_max, current_fan_percent + change)
+            target = self._clamp_fan_percent(current_fan_percent + change)
             return target, (
                 f"{name} {temp:.1f}°C (max {maximum:.1f}°C, rate {rate:+.3f}°C/s); "
                 f"increasing fan by {target - current_fan_percent}%"
@@ -232,7 +276,7 @@ class FanController:
             change = min(self.tuning.max_fall_step_percent, correction)
             if step_percent is not None:
                 change = min(change, max(0, int(step_percent)))
-            target = max(self.fan_min, current_fan_percent - change)
+            target = self._clamp_fan_percent(current_fan_percent - change)
             return target, (
                 f"{name} {temp:.1f}°C (min {minimum:.1f}°C, rate {rate:+.3f}°C/s); "
                 f"decreasing fan by {current_fan_percent - target}%"
@@ -309,7 +353,7 @@ class FanController:
             except IdracError as e:
                 logger.error(f"Cannot read sensors for fan control: {e}")
                 return FanControlResult(
-                    target_fan_percent=self._current_fan_percent,
+                    target_fan_percent=self._clamp_fan_percent(self._current_fan_percent),
                     cpu_temp=0,
                     disk_temp=None,
                     ambient_temp=0,
@@ -337,6 +381,7 @@ class FanController:
                 action_taken="no_action",
                 reason="No controller-reported fan duty or prior DSM target; skipping automatic command",
             )
+        live_fan_percent = self._clamp_fan_percent(live_fan_percent)
         self._current_fan_percent = live_fan_percent
 
         target_fan, reason = self._incremental_fan_logic(
@@ -347,6 +392,7 @@ class FanController:
             temperature_rates=temperature_rates,
         )
 
+        target_fan = self._clamp_fan_percent(target_fan)
         if target_fan > live_fan_percent:
             action = "increased"
         elif target_fan < live_fan_percent:

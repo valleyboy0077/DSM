@@ -4,8 +4,9 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from dsm.config import settings
-from dsm.sensor_poller import SensorPoller
+from dsm.fan_control import FanController
 from dsm.idrac_connector import FanSensor, TempSensor
+from dsm.sensor_poller import SensorPoller
 
 
 class FakeConnector:
@@ -216,7 +217,8 @@ async def test_auto_control_keeps_cached_target_when_no_usable_pwm_exists(monkey
 
 @pytest.mark.asyncio
 async def test_auto_keepalive_refreshes_cached_ipmi_target(monkeypatch):
-    poller = SensorPoller()
+    clock = FakeMonotonicClock()
+    poller = SensorPoller(monotonic_clock=clock)
     connector = FakeConnector()
     connector.drac_version = 'idrac7'
     connector._fan_control_backend = 'ipmi'
@@ -244,8 +246,12 @@ async def test_auto_keepalive_refreshes_cached_ipmi_target(monkeypatch):
     monkeypatch.setattr(poller, '_get_connector', fake_get_connector)
 
     await poller._refresh_auto_control_targets_once()
+    clock.value = settings.fan_control_idrac7_refresh_interval_seconds - 1
+    await poller._refresh_auto_control_targets_once()
+    clock.value += 1
+    await poller._refresh_auto_control_targets_once()
 
-    assert connector.calls == [('Manual', 7)]
+    assert connector.calls == [('Manual', 7), ('Manual', 7)]
 
 
 @pytest.mark.asyncio
@@ -394,7 +400,8 @@ async def test_stable_in_range_temperature_converges_without_command_churn(monke
 
 @pytest.mark.asyncio
 async def test_minimum_command_interval_prevents_repeat_hot_commands(monkeypatch):
-    poller = SensorPoller()
+    clock = FakeMonotonicClock()
+    poller = SensorPoller(monotonic_clock=clock)
     connector = FakeConnector()
     server = types.SimpleNamespace(id=1)
     fan_config = types.SimpleNamespace(auto_control=True, cpu_temp_min=35.0, cpu_temp_max=70.0,
@@ -409,8 +416,11 @@ async def test_minimum_command_interval_prevents_repeat_hot_commands(monkeypatch
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
     await poller._maybe_auto_control_fans(FakeSession(fan_config), server, connector, sensor_data, now=start)
+    clock.value = 5
     result = await poller._maybe_auto_control_fans(
-        FakeSession(fan_config), server, connector, sensor_data, now=start + timedelta(seconds=5)
+        # The wall clock can jump arbitrarily; the five monotonic seconds are
+        # what keep the dwell active.
+        FakeSession(fan_config), server, connector, sensor_data, now=start + timedelta(hours=1)
     )
 
     assert result["action_taken"] == "unchanged"
@@ -437,14 +447,16 @@ async def test_heating_during_dwell_uses_last_command_not_stale_pwm(monkeypatch)
         fans=[FanSensor(name="Fan 1", rpm=6000, member_id="Fan1", percent=20, health="OK")],
     )
     hotter_stale_pwm = types.SimpleNamespace(
-        temperatures=[TempSensor(name="CPU1 Temp", value_celsius=80.0, physical_context="CPU")],
+        temperatures=[TempSensor(name="CPU1 Temp", value_celsius=79.0, physical_context="CPU")],
         fans=[FanSensor(name="Fan 1", rpm=6000, member_id="Fan1", percent=20, health="OK")],
     )
 
     first = await poller._maybe_auto_control_fans(FakeSession(fan_config), server, connector, initial, now=start)
+    clock.value = 5
     during_dwell = await poller._maybe_auto_control_fans(
         FakeSession(fan_config), server, connector, hotter_stale_pwm, now=start + timedelta(seconds=5)
     )
+    clock.value = settings.fan_control_min_command_interval_seconds + 1
     after_dwell = await poller._maybe_auto_control_fans(
         FakeSession(fan_config), server, connector, hotter_stale_pwm,
         now=start + timedelta(seconds=settings.fan_control_min_command_interval_seconds + 1),
@@ -456,6 +468,17 @@ async def test_heating_during_dwell_uses_last_command_not_stale_pwm(monkeypatch)
     assert after_dwell["current_fan_percent"] == 32
     assert after_dwell["target_fan_percent"] == 44
     assert connector.calls == [("Manual", 32), ("Manual", 44)]
+
+
+def test_emergency_overtemperature_boundary_bypasses_dwell():
+    controller = FanController(FakeConnector(), cpu_temp_max=70.0)
+    sensor = TempSensor(
+        name="CPU1 Temp",
+        value_celsius=70.0 + settings.fan_control_emergency_cpu_overtemp_c,
+        physical_context="CPU",
+    )
+
+    assert SensorPoller._is_emergency_cpu_rise(controller, [sensor], [], {}) is True
 
 
 @pytest.mark.asyncio

@@ -4,9 +4,11 @@ import xml.etree.ElementTree as ET
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from dsm.api import fans as fans_api
-from dsm.fan_control import FanController
+from dsm.config import Settings
+from dsm.fan_control import FanController, FanControlTuning
 from dsm.idrac_connector import FanSensor, IdracConnector, IdracError, TempSensor
 
 
@@ -34,6 +36,61 @@ class FakeConnector:
         if self.ipmi_success:
             self._fan_control_backend = "ipmi"
         return self.ipmi_success
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("fan_control_rise_gain_percent_per_c", -0.1),
+        ("fan_control_rise_rate_gain_percent_per_c_per_sec", -0.1),
+        ("fan_control_fall_gain_percent_per_c", -0.1),
+        ("fan_control_rise_activation_margin_c", -0.1),
+        ("fan_control_temp_deadband_c", -0.1),
+        ("fan_control_rate_deadband_c_per_sec", -0.1),
+        ("fan_control_max_rise_step_percent", -1),
+        ("fan_control_max_fall_step_percent", -1),
+        ("fan_control_min_command_interval_seconds", -1),
+        ("fan_control_emergency_cpu_overtemp_c", -0.1),
+        ("fan_control_emergency_cpu_rate_c_per_sec", -0.1),
+        ("fan_control_max_temperature_sample_gap_seconds", 0),
+        ("fan_control_idrac7_refresh_interval_seconds", 0),
+        ("fan_control_rise_gain_percent_per_c", float("nan")),
+    ],
+)
+def test_settings_reject_unsafe_fan_tuning(field, value):
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **{field: value})
+
+
+def test_controller_sanitizes_direct_invalid_tuning_and_clamps_targets():
+    controller = FanController(
+        FakeConnector(),
+        cpu_temp_min=40.0,
+        cpu_temp_max=50.0,
+        fan_min=20,
+        fan_max=30,
+        tuning=FanControlTuning(
+            rise_gain_percent_per_c=-1.0,
+            rise_rate_gain_percent_per_c_per_sec=float("nan"),
+            fall_gain_percent_per_c=-1.0,
+            rise_activation_margin_c=-1.0,
+            temp_deadband_c=-1.0,
+            rate_deadband_c_per_sec=-1.0,
+            max_rise_step_percent=999,
+            max_fall_step_percent=999,
+        ),
+    )
+
+    assert controller.tuning.rise_gain_percent_per_c == 0.0
+    assert controller.tuning.rise_rate_gain_percent_per_c_per_sec == 0.0
+    assert controller.tuning.fall_gain_percent_per_c == 0.0
+    assert controller.tuning.max_rise_step_percent == 10
+    assert controller.tuning.max_fall_step_percent == 10
+
+    hot = {"cpu": [TempSensor(name="CPU1 Temp", value_celsius=90.0, physical_context="CPU")], "disk": []}
+    cool = {"cpu": [TempSensor(name="CPU1 Temp", value_celsius=0.0, physical_context="CPU")], "disk": []}
+    assert controller._incremental_fan_logic(hot, current_fan_percent=999, step_percent=None)[0] == 30
+    assert controller._incremental_fan_logic(cool, current_fan_percent=-999, step_percent=None)[0] == 20
 
 
 @pytest.mark.asyncio
@@ -159,10 +216,14 @@ async def test_manual_control_endpoint_succeeds_via_idrac7_racadm_fallback(monke
 
     monkeypatch.setattr(fans_api, 'execute_idrac_request', fake_execute_idrac_request)
     monkeypatch.setattr(fans_api, 'get_active_temp_profile_ranges', fake_get_active_temp_profile_ranges)
-    monkeypatch.setattr(
-        'dsm.api.sensors.poller',
-        SimpleNamespace(_last_fan_control_target={}, _last_fan_control_at={}),
+    runtime_state = SimpleNamespace(
+        _last_fan_control_target={1: 14},
+        _last_observed_fan_percent={1: 22},
+        _last_fan_control_at={1: 1.0},
+        _last_auto_refresh_at={1: 1.0},
+        _temperature_history={1: object()},
     )
+    monkeypatch.setattr('dsm.api.sensors.poller', runtime_state)
 
     result = await fans_api.control_fans(
         server_id=1,
@@ -179,6 +240,11 @@ async def test_manual_control_endpoint_succeeds_via_idrac7_racadm_fallback(monke
     assert config.mode == 'manual'
     assert config.auto_control is False
     assert config.manual_speed == 25
+    assert runtime_state._last_fan_control_target == {}
+    assert runtime_state._last_observed_fan_percent == {}
+    assert runtime_state._last_fan_control_at == {}
+    assert runtime_state._last_auto_refresh_at == {}
+    assert runtime_state._temperature_history == {}
 
 
 @pytest.mark.asyncio
