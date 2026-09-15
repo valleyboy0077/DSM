@@ -48,6 +48,19 @@ class Settings(BaseSettings):
     # Fan control evaluation interval in seconds
     fan_control_interval: int = 10
 
+    # Automatic fan control tuning.  These are deliberately conservative at
+    # steady state, but allow a bounded fast response when a CPU is heating.
+    fan_control_rise_gain_percent_per_c: float = 3.0
+    fan_control_rise_rate_gain_percent_per_c_per_sec: float = 12.0
+    fan_control_fall_gain_percent_per_c: float = 1.0
+    fan_control_rise_activation_margin_c: float = 3.0
+    fan_control_temp_deadband_c: float = 1.0
+    fan_control_rate_deadband_c_per_sec: float = 0.05
+    fan_control_max_rise_step_percent: int = 12
+    fan_control_max_fall_step_percent: int = 3
+    fan_control_min_command_interval_seconds: int = 15
+    fan_control_idrac7_refresh_interval_seconds: int = 60
+
     # Default temperature ranges for fan control (°C)
     default_cpu_temp_min: float = 45.0
     default_cpu_temp_max: float = 70.0
