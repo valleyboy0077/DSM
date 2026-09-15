@@ -43,6 +43,26 @@ def _clear_auto_control_runtime_state(server_id: int) -> None:
             state.pop(server_id, None)
 
 
+def _clear_auto_control_state_for_config_transition(
+    server_id: int,
+    *,
+    previous_mode: str,
+    previous_auto_control: bool,
+    mode: str,
+    auto_control: bool,
+) -> None:
+    """Discard automatic state that cannot safely cross a saved mode change.
+
+    A config PUT does not issue a fan command, but it can make the poller use
+    an old automatic target, observation, dwell time, refresh time, or
+    temperature sample as though it belonged to the newly selected mode.  In
+    particular, re-enabling automatic control must not let an iDRAC7 keepalive
+    immediately reapply a target from the prior automatic session.
+    """
+    if previous_mode != mode or (not previous_auto_control and auto_control):
+        _clear_auto_control_runtime_state(server_id)
+
+
 def _mark_automatic_command(server_id: int) -> None:
     """Record a direct API automatic command using the poller's monotonic clock."""
     from dsm.api.sensors import poller as sensor_poller
@@ -258,8 +278,11 @@ async def update_fan_config(
         select(FanConfig).where(FanConfig.server_id == server_id)
     )
     config = cast(Any, result.scalars().first())
+    existing_config = config is not None
 
-    if config:
+    if existing_config:
+        previous_mode = config.mode
+        previous_auto_control = bool(config.auto_control)
         config.mode = data.mode
         config.cpu_temp_min = data.cpu_temp_min
         config.cpu_temp_max = data.cpu_temp_max
@@ -276,6 +299,14 @@ async def update_fan_config(
         session.add(config)
 
     await session.commit()
+    if existing_config:
+        _clear_auto_control_state_for_config_transition(
+            server_id,
+            previous_mode=previous_mode,
+            previous_auto_control=previous_auto_control,
+            mode=data.mode,
+            auto_control=data.auto_control,
+        )
     await session.refresh(config)
     return config
 

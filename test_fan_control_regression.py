@@ -10,6 +10,7 @@ from dsm.api import fans as fans_api
 from dsm.config import Settings
 from dsm.fan_control import FanController, FanControlTuning
 from dsm.idrac_connector import FanSensor, IdracConnector, IdracError, TempSensor
+from dsm.sensor_poller import SensorPoller
 
 
 class FakeConnector:
@@ -245,6 +246,156 @@ async def test_manual_control_endpoint_succeeds_via_idrac7_racadm_fallback(monke
     assert runtime_state._last_fan_control_at == {}
     assert runtime_state._last_auto_refresh_at == {}
     assert runtime_state._temperature_history == {}
+
+
+@pytest.mark.asyncio
+async def test_put_fan_config_mode_transition_clears_auto_control_runtime_state(monkeypatch):
+    server = SimpleNamespace(id=1)
+    config = SimpleNamespace(
+        server_id=1,
+        mode="auto",
+        cpu_temp_min=45.0,
+        cpu_temp_max=70.0,
+        disk_temp_min=32.0,
+        disk_temp_max=45.0,
+        manual_speed=25,
+        polling_seconds=20,
+        auto_control=True,
+    )
+
+    class FakeResult:
+        def scalars(self):
+            return self
+
+        def first(self):
+            return config
+
+    class FakeSession:
+        async def get(self, model, pk):
+            assert model is fans_api.Server and pk == 1
+            return server
+
+        async def execute(self, query):
+            return FakeResult()
+
+        async def commit(self):
+            return None
+
+        async def refresh(self, obj):
+            assert obj is config
+
+    runtime_state = SimpleNamespace(
+        _last_fan_control_target={1: 14},
+        _last_observed_fan_percent={1: 22},
+        _last_fan_control_at={1: 1.0},
+        _last_auto_refresh_at={1: 1.0},
+        _temperature_history={1: object()},
+    )
+    monkeypatch.setattr("dsm.api.sensors.poller", runtime_state)
+
+    result = await fans_api.update_fan_config(
+        server_id=1,
+        data=fans_api.FanConfigCreate(
+            mode="manual",
+            cpu_temp_min=40.0,
+            cpu_temp_max=65.0,
+            disk_temp_min=30.0,
+            disk_temp_max=42.0,
+            manual_speed=31,
+            polling_seconds=30,
+            auto_control=False,
+        ),
+        _user=SimpleNamespace(),
+        session=FakeSession(),
+    )  # type: ignore[arg-type]
+
+    assert result is config
+    assert (config.mode, config.auto_control, config.manual_speed, config.polling_seconds) == (
+        "manual", False, 31, 30,
+    )
+    assert runtime_state._last_fan_control_target == {}
+    assert runtime_state._last_observed_fan_percent == {}
+    assert runtime_state._last_fan_control_at == {}
+    assert runtime_state._last_auto_refresh_at == {}
+    assert runtime_state._temperature_history == {}
+
+
+@pytest.mark.asyncio
+async def test_put_fan_config_reenabling_auto_cannot_refresh_stale_idrac7_target(monkeypatch):
+    server = SimpleNamespace(id=1, name="R730xd")
+    config = SimpleNamespace(
+        server_id=1,
+        mode="manual",
+        cpu_temp_min=45.0,
+        cpu_temp_max=70.0,
+        disk_temp_min=32.0,
+        disk_temp_max=45.0,
+        manual_speed=25,
+        polling_seconds=20,
+        auto_control=False,
+    )
+
+    class FakeResult:
+        def scalars(self):
+            return self
+
+        def first(self):
+            return config
+
+    class FakeSession:
+        async def get(self, model, pk):
+            assert model is fans_api.Server and pk == 1
+            return server
+
+        async def execute(self, query):
+            return FakeResult()
+
+        async def commit(self):
+            return None
+
+        async def refresh(self, obj):
+            assert obj is config
+
+    poller = SensorPoller()
+    poller._last_fan_control_target[1] = 14
+    poller._last_observed_fan_percent[1] = 22
+    poller._last_fan_control_at[1] = 1.0
+    poller._last_auto_refresh_at[1] = 1.0
+    poller._temperature_history[1] = object()
+    monkeypatch.setattr("dsm.api.sensors.poller", poller)
+
+    await fans_api.update_fan_config(
+        server_id=1,
+        data=fans_api.FanConfigCreate(mode="auto", auto_control=True),
+        _user=SimpleNamespace(),
+        session=FakeSession(),
+    )  # type: ignore[arg-type]
+
+    connector = FakeConnector(drac_version="idrac7")
+
+    class RefreshSession:
+        async def execute(self, query):
+            return SimpleNamespace(all=lambda: [(server, config)])
+
+    class RefreshSessionContext:
+        async def __aenter__(self):
+            return RefreshSession()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    async def fake_get_connector(_server):
+        return connector
+
+    monkeypatch.setattr("dsm.sensor_poller.async_session", lambda: RefreshSessionContext())
+    monkeypatch.setattr(poller, "_get_connector", fake_get_connector)
+
+    await poller._refresh_auto_control_targets_once()
+
+    assert connector.calls == []
+    assert poller._last_fan_control_target == {}
+    assert poller._last_observed_fan_percent == {}
+    assert poller._last_auto_refresh_at == {}
 
 
 @pytest.mark.asyncio
