@@ -5,10 +5,11 @@ stores readings in the database, and publishes via WebSocket.
 """
 
 import asyncio
+import copy
 import logging
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional, cast
 
 from sqlalchemy import select
@@ -50,7 +51,125 @@ class SensorPoller:
         # Latest usable controller-reported duty, retained separately from the
         # command target for telemetry and diagnostics.
         self._last_observed_fan_percent: dict[int, int] = {}
-        self._websocket_clients: list = []  # WebSocket for real-time updates
+        # Keep fleet dashboard clients separate from the legacy server streams.
+        # A fleet event must never be fanned out through a server-scoped URL.
+        self._dashboard_websocket_clients: list = []
+        self._server_websocket_clients: dict[int, list] = {}
+        # The dashboard reads this process-local cache first.  It deliberately
+        # holds normalized, JSON-ready values rather than ORM rows so a failed
+        # poll can retain the last known-good telemetry without touching the
+        # persisted history.
+        self._snapshot_cache: dict[int, dict[str, Any]] = {}
+        self._snapshot_revisions: dict[int, int] = {}
+        self._poll_all_lock = asyncio.Lock()
+        self._poll_cycle: dict[str, Any] = {
+            "cycle_id": 0,
+            "status": "idle",
+            "started_at": None,
+            "completed_at": None,
+            "duration_ms": None,
+            "next_poll_at": None,
+        }
+
+    @staticmethod
+    def _utcnow() -> datetime:
+        return datetime.now(timezone.utc)
+
+    @staticmethod
+    def _isoformat(value: Optional[datetime]) -> Optional[str]:
+        return value.isoformat() if value is not None else None
+
+    def get_cached_snapshot(self, server_id: int) -> Optional[dict[str, Any]]:
+        """Return a defensive copy of one normalized live snapshot."""
+        snapshot = self._snapshot_cache.get(server_id)
+        return self._snapshot_with_current_age(snapshot) if snapshot is not None else None
+
+    def get_dashboard_snapshot(self) -> dict[str, Any]:
+        """Return cache contents and lifecycle data for a cache-first client."""
+        return {
+            "servers": [self._snapshot_with_current_age(self._snapshot_cache[key]) for key in sorted(self._snapshot_cache)],
+            "poll_cycle": copy.deepcopy(self._poll_cycle),
+        }
+
+    def _snapshot_with_current_age(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        snapshot = copy.deepcopy(snapshot)
+        freshness = snapshot["freshness"]
+        age = self._age_seconds(freshness.get("captured_at"), self._utcnow())
+        freshness["age_seconds"] = age
+        if age is not None and age > settings.sensor_poll_interval * 2:
+            freshness["stale"] = True
+        return snapshot
+
+    @staticmethod
+    def _normalize_readings(result: dict[str, Any]) -> list[dict[str, Any]]:
+        timestamp = result.get("timestamp")
+        return [
+            {
+                "label": item.get("name"),
+                "type": item.get("type", "other"),
+                "value": item.get("value"),
+                "timestamp": timestamp,
+            }
+            for item in result.get("temperatures", [])
+        ]
+
+    @staticmethod
+    def _normalize_fans(result: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            {
+                "name": item.get("name"),
+                "member_id": item.get("member_id") or item.get("name"),
+                "rpm": item.get("rpm"),
+                "percent": item.get("percent"),
+                "percent_source": item.get("percent_source", "unavailable"),
+                "health": item.get("health"),
+                "source": "idrac",
+            }
+            for item in result.get("fans", [])
+        ]
+
+    def _cache_poll_result(self, result: dict[str, Any], cycle_id: int, attempted_at: datetime) -> dict[str, Any]:
+        """Merge a poll outcome into the live cache without losing good data."""
+        server_id = result.get("server_id")
+        if not isinstance(server_id, int):
+            return result
+
+        previous = self._snapshot_cache.get(server_id)
+        revision = self._snapshot_revisions.get(server_id, 0) + 1
+        self._snapshot_revisions[server_id] = revision
+        success = result.get("status") == "ok"
+        captured_at = result.get("timestamp") if success else (previous or {}).get("freshness", {}).get("captured_at")
+        snapshot = {
+            "server_id": server_id,
+            "server_name": result.get("server") or (previous or {}).get("server_name") or f"Server {server_id}",
+            "status": result.get("status") if not success else "online",
+            "revision": revision,
+            "cycle_id": cycle_id,
+            "freshness": {
+                "source": "memory" if success or previous else "unavailable",
+                "captured_at": captured_at,
+                "age_seconds": 0.0 if success else self._age_seconds(captured_at, attempted_at),
+                "stale": not success,
+                "last_error": None if success else result.get("error", "Polling failed"),
+                "last_attempt_at": self._isoformat(attempted_at),
+            },
+            "readings": self._normalize_readings(result) if success else copy.deepcopy((previous or {}).get("readings", [])),
+            "fans": self._normalize_fans(result) if success else copy.deepcopy((previous or {}).get("fans", [])),
+        }
+        self._snapshot_cache[server_id] = snapshot
+        return snapshot
+
+    @staticmethod
+    def _age_seconds(captured_at: Optional[str], now: datetime) -> Optional[float]:
+        if not captured_at:
+            return None
+        try:
+            captured = datetime.fromisoformat(captured_at)
+            if captured.tzinfo is None:
+                captured = captured.replace(tzinfo=timezone.utc)
+            return max(0.0, round((now - captured).total_seconds(), 3))
+        except (TypeError, ValueError):
+            return None
 
     def clear_auto_control_state(self, server_id: int) -> None:
         """Forget automatic-control state after an operator mode transition."""
@@ -60,14 +179,32 @@ class SensorPoller:
         self._last_auto_refresh_at.pop(server_id, None)
         self._temperature_history.pop(server_id, None)
 
-    def add_websocket_client(self, ws):
-        """Register a WebSocket client for real-time sensor updates."""
-        self._websocket_clients.append(ws)
+    def add_dashboard_websocket_client(self, ws) -> None:
+        """Register a client for the authenticated fleet dashboard stream."""
+        if ws not in self._dashboard_websocket_clients:
+            self._dashboard_websocket_clients.append(ws)
+
+    def add_websocket_client(self, ws, server_id: Optional[int] = None) -> None:
+        """Register a legacy server-scoped client.
+
+        ``server_id`` is deliberately required here so callers cannot create a
+        second, unauthenticated global broadcast channel by accident.
+        """
+        if server_id is None:
+            raise ValueError("server_id is required for the legacy sensor stream")
+        clients = self._server_websocket_clients.setdefault(server_id, [])
+        if ws not in clients:
+            clients.append(ws)
 
     def remove_websocket_client(self, ws):
         """Unregister a WebSocket client."""
-        if ws in self._websocket_clients:
-            self._websocket_clients.remove(ws)
+        while ws in self._dashboard_websocket_clients:
+            self._dashboard_websocket_clients.remove(ws)
+        for server_id, clients in list(self._server_websocket_clients.items()):
+            while ws in clients:
+                clients.remove(ws)
+            if not clients:
+                self._server_websocket_clients.pop(server_id, None)
 
     async def _get_connector(self, server: Server) -> Optional[IdracConnector]:
         """Get or create an IdracConnector for a server.
@@ -316,13 +453,23 @@ class SensorPoller:
         """
         connector = await self._get_connector(server)
         if connector is None:
-            return {"status": "error", "error": "Cannot decrypt credentials"}
+            return {
+                "status": "error",
+                "server": server.name,
+                "server_id": server.id,
+                "error": "Cannot decrypt credentials",
+            }
 
         async with async_session() as session:
             # Re-fetch the server in this session so ORM updates are tracked
             db_server = await session.get(Server, server.id)
             if db_server is None:
-                return {"status": "error", "error": f"Server {server.id} not found"}
+                return {
+                    "status": "error",
+                    "server": getattr(server, "name", f"Server {server.id}"),
+                    "server_id": server.id,
+                    "error": f"Server {server.id} not found",
+                }
 
             try:
                 # Fetch all thermal + fan data from iDRAC
@@ -357,11 +504,23 @@ class SensorPoller:
                     "server_id": db_server.id,
                     "timestamp": db_server.last_seen.isoformat(),
                     "temperatures": [
-                        {"name": t.name, "value": t.value_celsius, "context": t.physical_context}
+                        {
+                            "name": t.name,
+                            "type": self._classify_sensor(t),
+                            "value": t.value_celsius,
+                            "context": t.physical_context,
+                        }
                         for t in sensor_data.temperatures
                     ],
                     "fans": [
-                        {"name": f.name, "rpm": f.rpm}
+                        {
+                            "name": f.name,
+                            "member_id": f.member_id,
+                            "rpm": f.rpm,
+                            "percent": f.percent,
+                            "percent_source": getattr(f, "percent_source", "unavailable"),
+                            "health": f.health,
+                        }
                         for f in sensor_data.fans
                     ],
                     "power_state": sensor_data.system_info.power_state if sensor_data.system_info else "Unknown",
@@ -376,36 +535,95 @@ class SensorPoller:
                 db_server.status = ServerStatus.DEGRADED.value
                 await session.commit()
                 logger.warning(f"Poll error for {db_server.name}: {e}")
-                return {"status": "error", "server": db_server.name, "error": str(e)}
+                return {"status": "error", "server": db_server.name, "server_id": db_server.id, "error": str(e)}
             except Exception as e:
                 await session.rollback()
                 db_server.status = ServerStatus.OFFLINE.value
                 await session.commit()
                 logger.error(f"Unexpected error polling {db_server.name}: {e}")
-                return {"status": "error", "server": db_server.name, "error": str(e)}
+                return {"status": "error", "server": db_server.name, "server_id": db_server.id, "error": str(e)}
 
     async def poll_all(self) -> list:
         """Poll all registered servers.
 
-        Queries the database for all Server records, then polls each
-        one sequentially. Results are broadcast to WebSocket clients.
+        Queries the database for all Server records, then polls a bounded
+        number concurrently.  Calls are serialized so a slow cycle never
+        overlaps the next one.
 
         Returns:
             List of result dicts, one per server.
         """
-        async with async_session() as session:
-            result = select(Server)
-            servers = (await session.execute(result)).scalars().all()
+        async with self._poll_all_lock:
+            started_at = self._utcnow()
+            started_monotonic = self._monotonic_clock()
+            cycle_id = int(self._poll_cycle["cycle_id"]) + 1
+            self._poll_cycle = {
+                "cycle_id": cycle_id,
+                "status": "running",
+                "started_at": self._isoformat(started_at),
+                "completed_at": None,
+                "duration_ms": None,
+                "next_poll_at": None,
+            }
+            results: list[dict[str, Any]] = []
+            tasks: list[asyncio.Task[dict]] = []
+            cycle_cancelled = False
+            try:
+                async with async_session() as session:
+                    servers = (await session.execute(select(Server))).scalars().all()
 
-        results = []
-        for server in servers:
-            result = await self.poll_server(server)
-            results.append(result)
+                semaphore = asyncio.Semaphore(settings.sensor_poll_concurrency)
 
-            # Broadcast to connected WebSocket clients
-            await self._broadcast(result)
+                async def bounded_poll(server: Server) -> dict:
+                    async with semaphore:
+                        return await self.poll_server(server)
 
-        return results
+                tasks = [asyncio.create_task(bounded_poll(server)) for server in servers]
+                for completed in asyncio.as_completed(tasks):
+                    try:
+                        result = await completed
+                    except Exception as exc:  # defensive: poll_server normally contains failures
+                        logger.exception("Unhandled per-server poll failure: %s", exc)
+                        result = {"status": "error", "error": str(exc)}
+                    results.append(result)
+                    snapshot = self._cache_poll_result(result, cycle_id, self._utcnow())
+                    if snapshot is not result:
+                        # Event freshness is evaluated at emission time, just
+                        # like a snapshot read, rather than retaining the
+                        # provisional zero-age value from cache insertion.
+                        await self._broadcast_snapshot(self._snapshot_with_current_age(snapshot), cycle_id)
+
+                return results
+            except asyncio.CancelledError:
+                cycle_cancelled = True
+                self._poll_cycle["status"] = "cancelled"
+                raise
+            except Exception:
+                self._poll_cycle["status"] = "failed"
+                raise
+            finally:
+                pending_tasks = [task for task in tasks if not task.done()]
+                for task in pending_tasks:
+                    task.cancel()
+                if pending_tasks:
+                    await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+                completed_at = self._utcnow()
+                duration_seconds = max(0.0, self._monotonic_clock() - started_monotonic)
+                self._poll_cycle.update({
+                    "status": "completed" if self._poll_cycle["status"] == "running" else self._poll_cycle["status"],
+                    "completed_at": self._isoformat(completed_at),
+                    "duration_ms": round(duration_seconds * 1000, 3),
+                    "next_poll_at": self._isoformat(completed_at + timedelta(seconds=max(0.0, settings.sensor_poll_interval - duration_seconds))),
+                })
+                if not cycle_cancelled:
+                    await self._broadcast({
+                        "event": "poll.cycle.completed",
+                        "event_type": "poll.cycle.completed",
+                        "emitted_at": self._isoformat(completed_at),
+                        "cycle_id": cycle_id,
+                        "data": copy.deepcopy(self._poll_cycle),
+                    })
 
     async def _broadcast(self, data: dict):
         """Send JSON data to all connected WebSocket clients.
@@ -415,8 +633,26 @@ class SensorPoller:
         import json
         message = json.dumps(data)
         dead_clients = []
+        event_name = data.get("event")
+        if event_name == "server.telemetry.updated":
+            target_server_id = data.get("server_id")
+            recipients = list(self._dashboard_websocket_clients)
+            if isinstance(target_server_id, int):
+                recipients.extend(self._server_websocket_clients.get(target_server_id, []))
+        elif event_name == "poll.cycle.completed":
+            recipients = list(self._dashboard_websocket_clients)
+        else:
+            # There is intentionally no catch-all global channel.
+            recipients = []
 
-        for ws in self._websocket_clients:
+        unique_recipients = []
+        recipient_ids = set()
+        for ws in recipients:
+            if id(ws) not in recipient_ids:
+                recipient_ids.add(id(ws))
+                unique_recipients.append(ws)
+
+        for ws in unique_recipients:
             try:
                 await ws.send_text(message)
             except Exception as e:
@@ -426,17 +662,33 @@ class SensorPoller:
         for ws in dead_clients:
             self.remove_websocket_client(ws)
 
+    async def _broadcast_snapshot(self, snapshot: dict[str, Any], cycle_id: int) -> None:
+        """Publish a versioned telemetry event rather than an ad-hoc poll row."""
+        await self._broadcast({
+            "event": "server.telemetry.updated",
+            "event_type": "server.telemetry.updated",
+            "emitted_at": self._isoformat(self._utcnow()),
+            "cycle_id": cycle_id,
+            "revision": snapshot["revision"],
+            "server_id": snapshot["server_id"],
+            "data": snapshot,
+        })
+
     async def _poll_loop(self):
         """Main polling loop — runs while self._running is True."""
         while self._running:
+            cycle_started = self._monotonic_clock()
             try:
                 await self.poll_all()
             except Exception as e:
                 logger.error(f"Poll loop error: {e}")
 
-            # Sleep until next interval
+            # Start-to-start cadence is max(interval, poll duration), based on
+            # a monotonic clock so wall-clock changes cannot cause overlap.
+            elapsed = max(0.0, self._monotonic_clock() - cycle_started)
+            sleep_seconds = max(0.0, settings.sensor_poll_interval - elapsed)
             try:
-                await asyncio.sleep(settings.sensor_poll_interval)
+                await asyncio.sleep(sleep_seconds)
             except asyncio.CancelledError:
                 break
 

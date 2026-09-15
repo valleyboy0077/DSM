@@ -8,13 +8,14 @@ WebSocket endpoint for real-time push updates from the poller.
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
-from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from dsm.auth import get_current_user
-from dsm.database import get_session
 from dsm.api.idrac import execute_idrac_request
+from dsm.auth import decode_token, get_current_user
+from dsm.config import settings
+from dsm.database import async_session, get_session
 from dsm.models import SensorReading, Server, User
 from dsm.sensor_poller import SensorPoller
 
@@ -22,6 +23,113 @@ router = APIRouter(prefix="/sensors", tags=["sensors"])
 
 # Shared poller instance — started/stopped by app lifespan
 poller: SensorPoller = SensorPoller()
+
+
+async def _database_dashboard_snapshot(server: Server, session: AsyncSession) -> dict[str, Any]:
+    """Build the cold-start fallback while the poller's memory cache is empty."""
+    latest_timestamps = (
+        select(
+            SensorReading.server_id,
+            SensorReading.sensor_label,
+            func.max(SensorReading.timestamp).label("max_ts"),
+        )
+        .where(SensorReading.server_id == server.id)
+        .group_by(SensorReading.server_id, SensorReading.sensor_label)
+        .subquery()
+    )
+    result = await session.execute(
+        select(SensorReading)
+        .join(
+            latest_timestamps,
+            (SensorReading.server_id == latest_timestamps.c.server_id)
+            & SensorReading.sensor_label.is_not_distinct_from(latest_timestamps.c.sensor_label)
+            & (SensorReading.timestamp == latest_timestamps.c.max_ts),
+        )
+    )
+    latest: dict[str, SensorReading] = {}
+    for reading in result.scalars().all():
+        if reading.sensor_label not in latest:
+            latest[reading.sensor_label] = reading
+    readings = [
+        {
+            "label": reading.sensor_label,
+            "type": reading.sensor_type,
+            "value": reading.value,
+            "timestamp": reading.timestamp.isoformat() if reading.timestamp else None,
+        }
+        for reading in latest.values()
+    ]
+    captured_at = max((reading.timestamp for reading in latest.values() if reading.timestamp), default=None)
+    if captured_at is not None and captured_at.tzinfo is None:
+        captured_at = captured_at.replace(tzinfo=timezone.utc)
+    captured_at_iso = captured_at.isoformat() if captured_at is not None else None
+    age_seconds = (
+        max(0.0, round((datetime.now(timezone.utc) - captured_at).total_seconds(), 3))
+        if captured_at is not None
+        else None
+    )
+    return {
+        "server_id": server.id,
+        "server_name": server.name,
+        "status": server.status,
+        "revision": 0,
+        # A restarted poller cannot know the revision/cycle that wrote a DB
+        # row, so do not attribute persisted data to its current cycle.
+        "cycle_id": 0,
+        "freshness": {
+            "source": "database" if captured_at_iso else "unavailable",
+            "captured_at": captured_at_iso,
+            "age_seconds": age_seconds,
+            "stale": age_seconds is None or age_seconds > settings.sensor_poll_interval * 2,
+            "last_error": None,
+            "last_attempt_at": None,
+        },
+        "readings": readings,
+        "fans": [],
+    }
+
+
+@router.get("/dashboard-snapshot")
+@router.get("/dashboard", include_in_schema=False)
+async def get_dashboard_snapshot(
+    _user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Return cache-first normalized telemetry for all currently registered servers."""
+    servers = (await session.execute(select(Server).order_by(Server.id))).scalars().all()
+    snapshots = []
+    for server in servers:
+        snapshots.append(poller.get_cached_snapshot(server.id) or await _database_dashboard_snapshot(server, session))
+    return {"servers": snapshots, "poll_cycle": poller.get_dashboard_snapshot()["poll_cycle"]}
+
+
+async def _authenticate_websocket(websocket: WebSocket) -> bool:
+    """Authenticate a browser WebSocket with the same JWT issued at login.
+
+    Browsers cannot attach the API's Authorization header to a native
+    WebSocket constructor, so the dashboard supplies its login JWT in the
+    ``token`` query parameter.  It is validated and checked against the user
+    table before the socket is accepted.
+    """
+    authorization = websocket.headers.get("authorization", "")
+    token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else None
+    token = token or websocket.query_params.get("token") or websocket.query_params.get("access_token")
+    if not token:
+        await websocket.close(code=1008)
+        return False
+    try:
+        payload = decode_token(token)
+        user_id = int(payload["sub"])
+    except (HTTPException, KeyError, TypeError, ValueError):
+        await websocket.close(code=1008)
+        return False
+
+    async with async_session() as session:
+        user = await session.get(User, user_id)
+    if not user or not user.is_active:
+        await websocket.close(code=1008)
+        return False
+    return True
 
 
 @router.get("/")
@@ -235,6 +343,25 @@ async def get_live_sensors(
     }
 
 
+@router.websocket("/ws/dashboard")
+async def dashboard_websocket(websocket: WebSocket):
+    """Authenticated fleet telemetry stream for the dashboard."""
+    if not await _authenticate_websocket(websocket):
+        return
+    await websocket.accept()
+    poller.add_dashboard_websocket_client(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("Dashboard WebSocket error: %s", exc)
+    finally:
+        poller.remove_websocket_client(websocket)
+
+
 @router.websocket("/ws/{server_id}")
 async def sensor_websocket(websocket: WebSocket, server_id: int):
     """WebSocket endpoint for real-time sensor updates.
@@ -243,16 +370,19 @@ async def sensor_websocket(websocket: WebSocket, server_id: int):
     SensorPoller every polling cycle. The connection stays open
     until the client disconnects.
     """
+    if not await _authenticate_websocket(websocket):
+        return
     await websocket.accept()
-    poller.add_websocket_client(websocket)
+    poller.add_websocket_client(websocket, server_id=server_id)
 
     try:
         while True:
             # Keep connection alive — just consume ping/control messages
             await websocket.receive_text()
     except WebSocketDisconnect:
-        poller.remove_websocket_client(websocket)
+        pass
     except Exception as e:
         import logging
         logging.getLogger(__name__).warning(f"WebSocket error: {e}")
+    finally:
         poller.remove_websocket_client(websocket)

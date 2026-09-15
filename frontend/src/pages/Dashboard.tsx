@@ -1,16 +1,14 @@
 import type { CSSProperties } from 'react';
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../api';
-import type { FanTelemetryResponse, SensorSummary, Server } from '../types';
+import type { DashboardServerSnapshot, FanTelemetryResponse, SensorSummary, Server } from '../types';
 import { describeController, describeControllerSource } from '../serverMetadata';
 
 const statusClass = (status: string) => status === 'online' ? 'badge-green' : status === 'degraded' ? 'badge-yellow' : 'badge-red';
 
-type DashboardTelemetry = {
-  summary: SensorSummary | null;
-  fanTelemetry: FanTelemetryResponse | null;
-};
+type DashboardTelemetry = DashboardServerSnapshot;
+type StreamState = 'connecting' | 'live' | 'reconnecting' | 'offline';
 
 type HardwareInventory = {
   model?: string | null;
@@ -64,6 +62,20 @@ const HDD_TEMP_BANDS: GaugeBand[] = [
 function lastSeen(value: string | null) {
   if (!value) return 'Never seen';
   return new Date(value).toLocaleString([], { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+}
+
+function telemetryStatus(telemetry: DashboardTelemetry | undefined, fallback: string) {
+  const status = telemetry?.status;
+  return status === 'error' || status === 'unreachable' ? 'offline' : status || fallback;
+}
+
+function telemetryLabel(telemetry: DashboardTelemetry | undefined, streamState: StreamState) {
+  if (!telemetry) return 'Telemetry unavailable';
+  const freshness = telemetry.freshness;
+  const source = freshness.source === 'memory' ? 'Live cache' : freshness.source === 'database' ? 'Saved cache' : 'Unavailable';
+  const age = freshness.age_seconds === null ? null : `${Math.round(freshness.age_seconds)}s old`;
+  const state = freshness.stale ? 'stale' : streamState === 'live' ? 'streaming' : streamState;
+  return [source, age, state].filter(Boolean).join(' · ');
 }
 
 function average(values: number[]) {
@@ -313,13 +325,15 @@ function getSensorTempByLabel(summary: SensorSummary | null, pattern: RegExp) {
   return summary.sensors.find(sensor => pattern.test(sensor.label))?.value ?? null;
 }
 
-function ServerTelemetry({ server, telemetry, hardware }: { server: Server; telemetry: DashboardTelemetry | undefined; hardware?: HardwareInventory | null }) {
-  const fanPercent = getAverageFanPercent(telemetry?.fanTelemetry || null);
-  const { cpu1, cpu2 } = getCpuTemps(telemetry?.summary || null);
-  const inletTemp = getSensorTempByLabel(telemetry?.summary || null, /inlet|ambient/i);
-  const outletTemp = getSensorTempByLabel(telemetry?.summary || null, /outlet|exhaust/i);
-  const ssdTemp = getAverageSsdTemp(telemetry?.summary || null);
-  const hddTemp = getAverageHddTemp(telemetry?.summary || null);
+function ServerTelemetry({ server, telemetry, hardware, streamState }: { server: Server; telemetry: DashboardTelemetry | undefined; hardware?: HardwareInventory | null; streamState: StreamState }) {
+  const summary = telemetry ? { sensors: telemetry.readings } as SensorSummary : null;
+  const fanTelemetry = telemetry ? { fans: telemetry.fans } as FanTelemetryResponse : null;
+  const fanPercent = getAverageFanPercent(fanTelemetry);
+  const { cpu1, cpu2 } = getCpuTemps(summary);
+  const inletTemp = getSensorTempByLabel(summary, /inlet|ambient/i);
+  const outletTemp = getSensorTempByLabel(summary, /outlet|exhaust/i);
+  const ssdTemp = getAverageSsdTemp(summary);
+  const hddTemp = getAverageHddTemp(summary);
   const cpuCount = getInstalledCpuCount(hardware);
   const showCpu2 = cpuCount > 1 || cpu2 !== null;
 
@@ -416,7 +430,8 @@ function ServerTelemetry({ server, telemetry, hardware }: { server: Server; tele
 
       <div className="telemetry-footnote">
         <span>Server profile: {server.model || 'PowerEdge platform'}</span>
-        <span>Last seen: {lastSeen(server.last_seen)}</span>
+        <span title={telemetry?.freshness.last_error || undefined}>{telemetryLabel(telemetry, streamState)}</span>
+        {telemetry?.freshness.last_error && <span className="telemetry-error">Last poll error: {telemetry.freshness.last_error}</span>}
       </div>
     </div>
   );
@@ -427,32 +442,24 @@ export default function Dashboard() {
   const [telemetryByServer, setTelemetryByServer] = useState<Record<number, DashboardTelemetry>>({});
   const [hardwareByServer, setHardwareByServer] = useState<Record<number, HardwareInventory | null>>({});
   const [loading, setLoading] = useState(true);
+  const [snapshotError, setSnapshotError] = useState<string | null>(null);
+  const [streamState, setStreamState] = useState<StreamState>('connecting');
+  const snapshotRefreshInFlight = useRef(false);
 
-  const fetch = useCallback(async () => {
+  const hydrate = useCallback(async () => {
     setLoading(true);
     try {
-      const nextServers = await api.listServers();
+      const [nextServers, snapshot] = await Promise.all([api.listServers(), api.getDashboardSnapshot()]);
       setServers(nextServers);
-
-      const telemetryEntries = await Promise.all(
-        nextServers.map(async (server) => {
-          const [summaryResult, fanResult] = await Promise.allSettled([
-            api.getSensorSummary(server.id),
-            api.getFanTelemetry(server.id),
-          ]);
-
-          return [
-            server.id,
-            {
-              summary: summaryResult.status === 'fulfilled' ? summaryResult.value : null,
-              fanTelemetry: fanResult.status === 'fulfilled' ? fanResult.value : null,
-            },
-          ] as const;
-        })
-      );
-
-      setTelemetryByServer(Object.fromEntries(telemetryEntries));
-      setHardwareByServer(Object.fromEntries(nextServers.map((server) => [server.id, null])));
+      setTelemetryByServer(previous => {
+        const next = { ...previous };
+        for (const incoming of snapshot.servers) {
+          if ((next[incoming.server_id]?.revision ?? -1) <= incoming.revision) next[incoming.server_id] = incoming;
+        }
+        return next;
+      });
+      setSnapshotError(null);
+      setHardwareByServer(previous => Object.fromEntries(nextServers.map(server => [server.id, previous[server.id] ?? null])));
 
       void (async () => {
         const hardwareEntries = await Promise.all(
@@ -466,22 +473,95 @@ export default function Dashboard() {
           })
         );
 
-        setHardwareByServer(Object.fromEntries(hardwareEntries));
+        setHardwareByServer(previous => ({ ...previous, ...Object.fromEntries(hardwareEntries) }));
       })();
-    } catch {
-      setServers([]);
-      setTelemetryByServer({});
-      setHardwareByServer({});
+    } catch (error) {
+      // A failed refresh must not erase the last known-good fleet state.
+      setSnapshotError(error instanceof Error ? error.message : 'Unable to refresh dashboard telemetry');
     } finally {
       setLoading(false);
     }
   }, []);
 
-  useEffect(() => { fetch(); }, [fetch]);
+  useEffect(() => { void hydrate(); }, [hydrate]);
 
-  const online = servers.filter(s => s.status === 'online').length;
-  const degraded = servers.filter(s => s.status === 'degraded').length;
-  const offline = servers.filter(s => s.status === 'offline').length;
+  useEffect(() => {
+    let disposed = false;
+    let socket: WebSocket | null = null;
+    let reconnectTimer: number | null = null;
+    let attempt = 0;
+    let openedOnce = false;
+
+    const refreshSnapshot = async () => {
+      if (snapshotRefreshInFlight.current) return;
+      snapshotRefreshInFlight.current = true;
+      try {
+        const snapshot = await api.getDashboardSnapshot();
+        if (!disposed) {
+          setTelemetryByServer(previous => {
+            const next = { ...previous };
+            for (const incoming of snapshot.servers) {
+              if ((next[incoming.server_id]?.revision ?? -1) <= incoming.revision) next[incoming.server_id] = incoming;
+            }
+            return next;
+          });
+          setSnapshotError(null);
+        }
+      } catch (error) {
+        if (!disposed) setSnapshotError(error instanceof Error ? error.message : 'Unable to refresh dashboard telemetry');
+      } finally {
+        snapshotRefreshInFlight.current = false;
+      }
+    };
+
+    const connect = () => {
+      const url = api.dashboardWebSocketUrl();
+      if (!url) {
+        setStreamState('offline');
+        return;
+      }
+      setStreamState(attempt ? 'reconnecting' : 'connecting');
+      socket = new WebSocket(url);
+      socket.onopen = () => {
+        if (disposed) return;
+        setStreamState('live');
+        attempt = 0;
+        if (openedOnce) void refreshSnapshot();
+        openedOnce = true;
+      };
+      socket.onmessage = event => {
+        try {
+          const message = JSON.parse(event.data) as { event?: string; server_id?: number; revision?: number; data?: DashboardTelemetry };
+          if (message.event !== 'server.telemetry.updated' || !message.data || typeof message.server_id !== 'number' || typeof message.revision !== 'number') return;
+          setTelemetryByServer(previous => {
+            const current = previous[message.server_id!];
+            return current && message.revision! <= current.revision ? previous : { ...previous, [message.server_id!]: message.data! };
+          });
+        } catch {
+          // Ignore malformed stream frames and preserve the current telemetry.
+        }
+      };
+      socket.onclose = () => {
+        if (disposed) return;
+        const delay = Math.min(30_000, 1_000 * 2 ** attempt);
+        attempt += 1;
+        setStreamState('reconnecting');
+        reconnectTimer = window.setTimeout(connect, delay);
+      };
+      socket.onerror = () => socket?.close();
+    };
+
+    connect();
+    return () => {
+      disposed = true;
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      socket?.close();
+    };
+  }, []);
+
+  const online = servers.filter(s => telemetryStatus(telemetryByServer[s.id], s.status) === 'online').length;
+  const degraded = servers.filter(s => telemetryStatus(telemetryByServer[s.id], s.status) === 'degraded').length;
+  const offline = servers.filter(s => telemetryStatus(telemetryByServer[s.id], s.status) === 'offline').length;
   const health = servers.length ? Math.round((online / servers.length) * 100) : 0;
 
   return (
@@ -530,6 +610,7 @@ export default function Dashboard() {
       </div>
 
       <div className="section-title">Managed servers</div>
+      {snapshotError && <div className="inline-alert danger">Telemetry refresh failed: {snapshotError}. Showing last known telemetry.</div>}
       {loading ? (
         <div className="grid grid-3"><div className="skeleton" /><div className="skeleton" /><div className="skeleton" /></div>
       ) : servers.length === 0 ? (
@@ -540,14 +621,16 @@ export default function Dashboard() {
         </div>
       ) : (
         <div className="grid dashboard-server-grid">
-          {servers.map(s => (
-            <article key={s.id} className={`card server-card ${s.status}`}>
+          {servers.map(s => {
+            const status = telemetryStatus(telemetryByServer[s.id], s.status);
+            return (
+            <article key={s.id} className={`card server-card ${status}`}>
               <div className="server-header">
                 <div>
                   <div className="server-name">{s.name}</div>
                   <div className="server-meta">{hardwareByServer[s.id]?.model || s.model || 'Unknown Dell platform'}</div>
                 </div>
-                <span className={`badge ${statusClass(s.status)}`}><span className={`status-dot ${s.status}`} />{s.status}</span>
+                <span className={`badge ${statusClass(status)}`}><span className={`status-dot ${status}`} />{status}</span>
               </div>
 
               <div className="server-card-layout">
@@ -567,7 +650,7 @@ export default function Dashboard() {
                 </div>
 
                 <div className="server-telemetry-panel">
-                  <ServerTelemetry server={s} telemetry={telemetryByServer[s.id]} hardware={hardwareByServer[s.id]} />
+                  <ServerTelemetry server={s} telemetry={telemetryByServer[s.id]} hardware={hardwareByServer[s.id]} streamState={streamState} />
                 </div>
               </div>
 
@@ -577,7 +660,8 @@ export default function Dashboard() {
                 <Link to={`/server/${s.id}/settings`} className="btn btn-sm btn-primary">Settings</Link>
               </div>
             </article>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>

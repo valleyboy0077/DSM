@@ -1,6 +1,18 @@
-import type { Server, SensorReading, FanConfig, FanControlResult, FanTelemetryResponse, SensorSummary, User, ServerGroup, TempProfile } from './types';
+import type { DashboardSnapshot, Server, SensorReading, FanConfig, FanControlResult, FanTelemetryResponse, SensorSummary, User, ServerGroup, TempProfile } from './types';
 
 const API = '';
+
+function dashboardWebSocketUrl(): string | null {
+  const token = localStorage.getItem('dsm_token');
+  if (!token) return null;
+
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url = new URL('/sensors/ws/dashboard', `${protocol}//${window.location.host}`);
+  // Native browser WebSockets cannot set the API Authorization header. The
+  // server validates this short-lived login token before accepting the socket.
+  url.searchParams.set('token', token);
+  return url.toString();
+}
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const token = localStorage.getItem('dsm_token');
@@ -75,6 +87,8 @@ export const api = {
   },
   getSensorSummary: (serverId: number) =>
     request<SensorSummary>(`/sensors/summary/${serverId}`),
+  getDashboardSnapshot: () => request<DashboardSnapshot>('/sensors/dashboard-snapshot'),
+  dashboardWebSocketUrl,
 
   // Fans
   getFanConfig: (serverId: number) => request<FanConfig>(`/fans/${serverId}`),
