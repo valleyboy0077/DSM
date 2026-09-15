@@ -6,6 +6,7 @@ stores readings in the database, and publishes via WebSocket.
 
 import asyncio
 import logging
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Optional, cast
 
@@ -14,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from dsm.config import settings
 from dsm.database import async_session
-from dsm.fan_control import FanController
+from dsm.fan_control import FanController, FanControlTuning
 from dsm.idrac_connector import IdracConnector, IdracError
 from dsm.models import FanConfig, FanMode, Server, ServerStatus, SensorReading
 from dsm.temp_profile_repository import get_active_temp_profile_ranges
@@ -36,6 +37,9 @@ class SensorPoller:
         self._manual_override_task: Optional[asyncio.Task] = None
         self._connectors: dict = {}  # server_id -> IdracConnector
         self._last_fan_control_at: dict[int, datetime] = {}
+        self._last_auto_refresh_at: dict[int, datetime] = {}
+        # Last two timestamped readings per server, keyed by physical sensor.
+        self._temperature_history: dict[int, deque[tuple[datetime, dict[str, float]]]] = {}
         # Remember the last fan percentage we successfully commanded per server.
         # Some iDRAC paths report stale PWM percentages while a manual override is
         # active, so the next thermal decision needs the commanded target rather
@@ -92,19 +96,55 @@ class SensorPoller:
             return int(max(percents))
         return None
 
+    @staticmethod
+    def _fan_control_tuning() -> FanControlTuning:
+        return FanControlTuning(
+            rise_gain_percent_per_c=settings.fan_control_rise_gain_percent_per_c,
+            rise_rate_gain_percent_per_c_per_sec=settings.fan_control_rise_rate_gain_percent_per_c_per_sec,
+            fall_gain_percent_per_c=settings.fan_control_fall_gain_percent_per_c,
+            rise_activation_margin_c=settings.fan_control_rise_activation_margin_c,
+            temp_deadband_c=settings.fan_control_temp_deadband_c,
+            rate_deadband_c_per_sec=settings.fan_control_rate_deadband_c_per_sec,
+            max_rise_step_percent=settings.fan_control_max_rise_step_percent,
+            max_fall_step_percent=settings.fan_control_max_fall_step_percent,
+        )
+
+    def _temperature_rates(self, server_id: int, temperatures: list[Any], now: datetime) -> dict[str, float]:
+        """Calculate per-sensor °C/s from timestamped server-local history."""
+        current = {
+            FanController.sensor_key(sensor): float(sensor.value_celsius)
+            for sensor in temperatures
+            if FanController._classify_temp(sensor) in {"cpu", "disk"}
+        }
+        history = self._temperature_history.setdefault(server_id, deque(maxlen=2))
+        rates: dict[str, float] = {}
+        if history:
+            previous_at, previous = history[-1]
+            elapsed = (now - previous_at).total_seconds()
+            if elapsed > 0:
+                rates = {
+                    key: (value - previous[key]) / elapsed
+                    for key, value in current.items() if key in previous
+                }
+        history.append((now, current))
+        return rates
+
     async def _maybe_auto_control_fans(
         self,
         session: AsyncSession,
         server: Server,
         connector: IdracConnector,
         sensor_data,
+        now: Optional[datetime] = None,
     ) -> Optional[dict]:
         result = await session.execute(select(FanConfig).where(FanConfig.server_id == server.id))
         fan_config = cast(Any, result.scalars().first())
         if not fan_config or not fan_config.auto_control:
             return None
 
+        now = now or datetime.now(timezone.utc)
         profile_ranges = await get_active_temp_profile_ranges(session, server.id)
+        temperature_rates = self._temperature_rates(server.id, sensor_data.temperatures, now)
         inventory_fan_percent = self._current_fan_percent_from_inventory(sensor_data.fans)
         # Control from observed iDRAC PWM whenever it is available.  A command
         # is a request, not proof of the physical duty: iDRAC can clamp it for
@@ -140,6 +180,7 @@ class SensorPoller:
             disk_temp_max=fan_config.disk_temp_max,
             fan_min=7,
             fan_max=100,
+            tuning=self._fan_control_tuning(),
         )
         controller._mode = FanMode.AUTO.value
         controller._current_fan_percent = current_fan_percent
@@ -147,18 +188,36 @@ class SensorPoller:
             sensor_data=sensor_data,
             current_fan_percent=current_fan_percent,
             profile_ranges=profile_ranges,
-            step_percent=3,
+            temperature_rates=temperature_rates,
+            apply=False,
         )
-        now = datetime.now(timezone.utc)
+        # Polling can be much faster than a chassis can react.  Do not issue
+        # another automatic command until the configured dwell has elapsed.
+        last_command = self._last_fan_control_at.get(server.id)
+        if (
+            result.action_taken in {"increased", "decreased"}
+            and last_command is not None
+            and (now - last_command).total_seconds() < settings.fan_control_min_command_interval_seconds
+        ):
+            result.target_fan_percent = current_fan_percent
+            result.action_taken = "unchanged"
+            result.reason = "Minimum automatic command interval active; holding fan target"
         if result.action_taken in {"increased", "decreased"}:
-            self._last_fan_control_at[server.id] = now
-            self._last_fan_control_target[server.id] = result.target_fan_percent
+            success = await controller._apply_fan_mode("Manual", result.target_fan_percent)
+            if success:
+                self._last_fan_control_at[server.id] = now
+                self._last_fan_control_target[server.id] = result.target_fan_percent
+            else:
+                result.action_taken = "unchanged"
+                result.target_fan_percent = current_fan_percent
+                result.reason = "Failed to apply automatic fan target; holding previous target"
         return {
             "target_fan_percent": result.target_fan_percent,
             "action_taken": result.action_taken,
             "reason": result.reason,
             "current_fan_percent": current_fan_percent,
             "polling_seconds": settings.sensor_poll_interval,
+            "temperature_rates_c_per_sec": temperature_rates,
         }
 
     async def poll_server(self, server: Server) -> dict:
@@ -364,10 +423,15 @@ class SensorPoller:
                 continue
             if getattr(connector, "_fan_control_backend", None) != "ipmi":
                 continue
+            now = datetime.now(timezone.utc)
+            last_refresh = self._last_auto_refresh_at.get(server.id)
+            if last_refresh and (now - last_refresh).total_seconds() < settings.fan_control_idrac7_refresh_interval_seconds:
+                continue
             controller = FanController(connector=connector, fan_min=7)
             controller._mode = FanMode.AUTO.value
             success = await controller._apply_fan_mode("Manual", target)
             if success:
+                self._last_auto_refresh_at[server.id] = now
                 logger.info(
                     "Refreshed auto fan target for %s at %s%%",
                     server.name,

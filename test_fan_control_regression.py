@@ -204,7 +204,7 @@ async def test_manual_override_does_not_translate_a_valid_low_dell_duty_to_auto_
 
 
 @pytest.mark.asyncio
-async def test_idrac7_unchanged_auto_cycle_refreshes_manual_target():
+async def test_idrac7_unchanged_auto_cycle_does_not_churn_manual_target():
     connector = FakeConnector(drac_version='idrac7')
     controller = FanController(
         connector=connector,  # type: ignore[arg-type]
@@ -233,7 +233,7 @@ async def test_idrac7_unchanged_auto_cycle_refreshes_manual_target():
 
     assert result.action_taken == 'unchanged'
     assert result.target_fan_percent == 7
-    assert connector.calls == [('ipmi', 'Manual', 7)]
+    assert connector.calls == []
 
 
 @pytest.mark.asyncio

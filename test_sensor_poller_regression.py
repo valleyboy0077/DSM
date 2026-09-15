@@ -1,4 +1,5 @@
 import types
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -111,8 +112,8 @@ async def test_auto_control_steps_up_from_observed_pwm_when_cached_target_is_low
     result = await poller._maybe_auto_control_fans(FakeSession(fan_config), server, connector, sensor_data)
 
     assert result["current_fan_percent"] == 27
-    assert result["target_fan_percent"] == 30
-    assert connector.calls == [("Manual", 30)]
+    assert result["target_fan_percent"] == 39
+    assert connector.calls == [("Manual", 39)]
 
 
 @pytest.mark.asyncio
@@ -235,3 +236,114 @@ async def test_auto_keepalive_refreshes_cached_ipmi_target(monkeypatch):
     await poller._refresh_auto_control_targets_once()
 
     assert connector.calls == [('Manual', 7)]
+
+
+def test_temperature_rate_is_calculated_per_server_sensor_from_timestamps():
+    poller = SensorPoller()
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    sensor = TempSensor(name="CPU1 Temp", value_celsius=50.0, physical_context="CPU")
+
+    assert poller._temperature_rates(1, [sensor], start) == {}
+
+    warmer = TempSensor(name="CPU1 Temp", value_celsius=54.0, physical_context="CPU")
+    rates = poller._temperature_rates(1, [warmer], start + timedelta(seconds=8))
+
+    assert rates == {"cpu1 temp|cpu": 0.5}
+
+
+@pytest.mark.asyncio
+async def test_rapid_cpu_rise_near_max_gets_fast_bounded_response(monkeypatch):
+    poller = SensorPoller()
+    connector = FakeConnector()
+    server = types.SimpleNamespace(id=1)
+    fan_config = types.SimpleNamespace(auto_control=True, cpu_temp_min=35.0, cpu_temp_max=70.0,
+                                       disk_temp_min=32.0, disk_temp_max=45.0)
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    async def profile_ranges(*_args):
+        return []
+
+    monkeypatch.setattr("dsm.sensor_poller.get_active_temp_profile_ranges", profile_ranges)
+    first = types.SimpleNamespace(
+        temperatures=[TempSensor(name="CPU1 Temp", value_celsius=68.0, physical_context="CPU")],
+        fans=[FanSensor(name="Fan 1", rpm=6000, member_id="Fan1", percent=20, health="OK")],
+    )
+    second = types.SimpleNamespace(
+        temperatures=[TempSensor(name="CPU1 Temp", value_celsius=70.0, physical_context="CPU")],
+        fans=[FanSensor(name="Fan 1", rpm=6000, member_id="Fan1", percent=20, health="OK")],
+    )
+
+    await poller._maybe_auto_control_fans(FakeSession(fan_config), server, connector, first, now=start)
+    result = await poller._maybe_auto_control_fans(
+        FakeSession(fan_config), server, connector, second, now=start + timedelta(seconds=2)
+    )
+
+    assert result["temperature_rates_c_per_sec"] == {"cpu1 temp|cpu": 1.0}
+    assert result["target_fan_percent"] == 31
+    assert connector.calls[-1] == ("Manual", 31)
+
+
+@pytest.mark.asyncio
+async def test_cooldown_is_damped_and_rising_temperature_blocks_fall():
+    from dsm.fan_control import FanController
+
+    controller = FanController(FakeConnector(), cpu_temp_min=40.0, cpu_temp_max=70.0)
+    cool = {"cpu": [TempSensor(name="CPU1 Temp", value_celsius=32.0, physical_context="CPU")], "disk": []}
+    target, _ = controller._incremental_fan_logic(cool, 30)
+    assert target == 27  # asymmetric fall slew cap
+
+    rising_cool = {"cpu": [TempSensor(name="CPU1 Temp", value_celsius=32.0, physical_context="CPU")], "disk": []}
+    target, _ = controller._incremental_fan_logic(rising_cool, 30, temperature_rates={"cpu1 temp|cpu": 0.2})
+    assert target == 30
+
+
+@pytest.mark.asyncio
+async def test_stable_in_range_temperature_converges_without_command_churn(monkeypatch):
+    poller = SensorPoller()
+    connector = FakeConnector()
+    server = types.SimpleNamespace(id=1)
+    fan_config = types.SimpleNamespace(auto_control=True, cpu_temp_min=35.0, cpu_temp_max=70.0,
+                                       disk_temp_min=32.0, disk_temp_max=45.0)
+    sensor_data = types.SimpleNamespace(
+        temperatures=[TempSensor(name="CPU1 Temp", value_celsius=50.0, physical_context="CPU")],
+        fans=[FanSensor(name="Fan 1", rpm=6000, member_id="Fan1", percent=22, health="OK")],
+    )
+    async def profile_ranges(*_args):
+        return []
+    monkeypatch.setattr("dsm.sensor_poller.get_active_temp_profile_ranges", profile_ranges)
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    first = await poller._maybe_auto_control_fans(FakeSession(fan_config), server, connector, sensor_data, now=start)
+    second = await poller._maybe_auto_control_fans(
+        FakeSession(fan_config), server, connector, sensor_data, now=start + timedelta(seconds=20)
+    )
+
+    assert first["target_fan_percent"] == second["target_fan_percent"] == 22
+    assert first["action_taken"] == second["action_taken"] == "unchanged"
+    assert connector.calls == []
+
+
+@pytest.mark.asyncio
+async def test_minimum_command_interval_prevents_repeat_hot_commands(monkeypatch):
+    poller = SensorPoller()
+    connector = FakeConnector()
+    server = types.SimpleNamespace(id=1)
+    fan_config = types.SimpleNamespace(auto_control=True, cpu_temp_min=35.0, cpu_temp_max=70.0,
+                                       disk_temp_min=32.0, disk_temp_max=45.0)
+    sensor_data = types.SimpleNamespace(
+        temperatures=[TempSensor(name="CPU1 Temp", value_celsius=75.0, physical_context="CPU")],
+        fans=[FanSensor(name="Fan 1", rpm=6000, member_id="Fan1", percent=27, health="OK")],
+    )
+    async def profile_ranges(*_args):
+        return []
+    monkeypatch.setattr("dsm.sensor_poller.get_active_temp_profile_ranges", profile_ranges)
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    await poller._maybe_auto_control_fans(FakeSession(fan_config), server, connector, sensor_data, now=start)
+    result = await poller._maybe_auto_control_fans(
+        FakeSession(fan_config), server, connector, sensor_data, now=start + timedelta(seconds=5)
+    )
+
+    assert result["action_taken"] == "unchanged"
+    assert "Minimum automatic command interval" in result["reason"]
+    assert connector.calls == [("Manual", 39)]

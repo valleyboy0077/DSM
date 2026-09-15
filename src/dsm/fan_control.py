@@ -8,7 +8,7 @@ version-appropriate control path.
 import logging
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Mapping, Optional
 
 from dsm.idrac_connector import IdracConnector, IdracError, TempSensor
 from dsm.models import FanMode
@@ -25,6 +25,20 @@ class FanControlResult:
     ambient_temp: float
     action_taken: str  # 'increased', 'decreased', 'unchanged', 'no_action'
     reason: str
+
+
+@dataclass(frozen=True)
+class FanControlTuning:
+    """Explicit, bounded tuning for DSM's negative-feedback thermal loop."""
+
+    rise_gain_percent_per_c: float = 3.0
+    rise_rate_gain_percent_per_c_per_sec: float = 12.0
+    fall_gain_percent_per_c: float = 1.0
+    rise_activation_margin_c: float = 3.0
+    temp_deadband_c: float = 1.0
+    rate_deadband_c_per_sec: float = 0.05
+    max_rise_step_percent: int = 12
+    max_fall_step_percent: int = 3
 
 
 class FanController:
@@ -54,6 +68,7 @@ class FanController:
         disk_temp_max: float = 45.0,
         fan_min: int = 7,
         fan_max: int = 100,
+        tuning: Optional[FanControlTuning] = None,
     ):
         self.connector = connector
         self.cpu_temp_min = cpu_temp_min
@@ -62,12 +77,14 @@ class FanController:
         self.disk_temp_max = disk_temp_max
         self.fan_min = fan_min
         self.fan_max = fan_max
+        self.tuning = tuning or FanControlTuning()
 
         # State
         self._current_fan_percent: int = fan_min
         self._mode: str = FanMode.AUTO.value
 
-    def _classify_temp(self, sensor: TempSensor) -> str:
+    @staticmethod
+    def _classify_temp(sensor: TempSensor) -> str:
         """Classify sensor by type based on name and physical context."""
         name_lower = sensor.name.lower()
         context = sensor.physical_context.lower()
@@ -152,21 +169,20 @@ class FanController:
         current_fan_percent: int,
         profile_ranges: Optional[list] = None,
         step_percent: int = 3,
+        temperature_rates: Optional[Mapping[str, float]] = None,
     ) -> tuple[int, str]:
-        """Small-step thermal policy: move fans up or down by a few percent.
+        """Return a bounded P+D correction from current temperatures and rates.
 
-        Increase when any CPU or drive sensor is above its max threshold.
-        Decrease only when every available CPU/drive sensor is below its own
-        minimum threshold.  Sensors in the configured band deliberately hold
-        the current target: a cool CPU must never reduce airflow for an
-        in-range disk (or vice versa).  Ambient telemetry is reported but has
-        no configured control band, so it does not independently change duty.
+        The asymmetric loop deliberately raises faster than it falls.  It only
+        cools down once every controlled sensor is safely below its lower band,
+        and it holds in the deadband so a stable workload does not hunt.
+        ``step_percent`` remains accepted for API compatibility; tuning governs
+        the actual bounded slew limits.
         """
-        step_percent = max(1, min(10, step_percent))
         current_fan_percent = max(self.fan_min, min(self.fan_max, current_fan_percent))
-
-        hot_sensors = []
-        cool_sensors = []
+        rates = temperature_rates or {}
+        heating = []
+        cooling = []
         monitored_sensors = []
 
         for category in ("cpu", "disk"):
@@ -174,24 +190,57 @@ class FanController:
                 monitored_sensors.append(sensor)
                 min_temp, max_temp = self._thresholds_for_sensor(sensor, profile_ranges)
                 temp = sensor.value_celsius
-                if temp > max_temp:
-                    hot_sensors.append((sensor.name, temp, max_temp))
-                elif temp < min_temp:
-                    cool_sensors.append((sensor.name, temp, min_temp))
+                rate = rates.get(self.sensor_key(sensor), 0.0)
+                # Outside the upper threshold, proportional error dominates.
+                # Close to it, only a meaningful positive rate starts a gentle
+                # pre-emptive rise; stable in-range temperatures hold.
+                if temp > max_temp or (
+                    temp >= max_temp - self.tuning.rise_activation_margin_c
+                    and rate > self.tuning.rate_deadband_c_per_sec
+                ):
+                    proportional_error = max(0.0, temp - max_temp)
+                    derivative = max(0.0, rate - self.tuning.rate_deadband_c_per_sec)
+                    correction = (
+                        self.tuning.rise_gain_percent_per_c * proportional_error
+                        + self.tuning.rise_rate_gain_percent_per_c_per_sec * derivative
+                    )
+                    # A temperature already above max must make progress even
+                    # if its fractional proportional correction rounds down.
+                    heating.append((max(1, round(correction)), sensor.name, temp, max_temp, rate))
+                if temp < min_temp - self.tuning.temp_deadband_c:
+                    cooling.append((sensor.name, temp, min_temp, rate))
 
-        if hot_sensors:
-            target = min(self.fan_max, current_fan_percent + step_percent)
-            hottest = max(hot_sensors, key=lambda item: item[1])
-            return target, f"{hottest[0]} {hottest[1]:.1f}°C > {hottest[2]:.1f}°C max; increasing fan by {step_percent}%"
+        if heating:
+            correction, name, temp, maximum, rate = max(heating, key=lambda item: item[0])
+            change = min(self.tuning.max_rise_step_percent, correction)
+            target = min(self.fan_max, current_fan_percent + change)
+            return target, (
+                f"{name} {temp:.1f}°C (max {maximum:.1f}°C, rate {rate:+.3f}°C/s); "
+                f"increasing fan by {target - current_fan_percent}%"
+            )
 
-        if monitored_sensors and len(cool_sensors) == len(monitored_sensors):
-            target = max(self.fan_min, current_fan_percent - step_percent)
-            coolest = min(cool_sensors, key=lambda item: item[1])
-            return target, f"{coolest[0]} {coolest[1]:.1f}°C < {coolest[2]:.1f}°C min; decreasing fan by {step_percent}%"
+        # Do not reduce airflow if any monitored temperature is in its band or
+        # rising: that is the hysteresis which prevents up/down oscillation.
+        if monitored_sensors and len(cooling) == len(monitored_sensors) and all(
+            rate <= self.tuning.rate_deadband_c_per_sec for _, _, _, rate in cooling
+        ):
+            name, temp, minimum, rate = min(cooling, key=lambda item: item[1])
+            correction = max(1, round(self.tuning.fall_gain_percent_per_c * (minimum - temp)))
+            change = min(self.tuning.max_fall_step_percent, correction)
+            target = max(self.fan_min, current_fan_percent - change)
+            return target, (
+                f"{name} {temp:.1f}°C (min {minimum:.1f}°C, rate {rate:+.3f}°C/s); "
+                f"decreasing fan by {current_fan_percent - target}%"
+            )
 
         if not monitored_sensors:
             return current_fan_percent, "No CPU or drive temperatures available; holding fan speed"
-        return current_fan_percent, "At least one temperature is within its configured range; holding fan speed"
+        return current_fan_percent, "At least one temperature is within its configured range, deadband, or rising; holding fan speed"
+
+    @staticmethod
+    def sensor_key(sensor: TempSensor) -> str:
+        """Stable per-server history key for a temperature sensor."""
+        return "|".join((sensor.name.strip().lower(), sensor.physical_context.strip().lower()))
 
     def _derive_current_fan_percent(self, fans: list) -> Optional[int]:
         """Return only a controller-reported duty, never an RPM estimate."""
@@ -240,6 +289,8 @@ class FanController:
         current_fan_percent: Optional[int] = None,
         profile_ranges: Optional[list] = None,
         step_percent: int = 3,
+        temperature_rates: Optional[Mapping[str, float]] = None,
+        apply: bool = True,
     ) -> FanControlResult:
         """Run one fan control cycle.
 
@@ -288,6 +339,7 @@ class FanController:
             current_fan_percent=live_fan_percent,
             profile_ranges=profile_ranges,
             step_percent=step_percent,
+            temperature_rates=temperature_rates,
         )
 
         if target_fan > live_fan_percent:
@@ -306,34 +358,14 @@ class FanController:
             reason=reason,
         )
 
-        should_refresh_manual_override = (
-            action == "unchanged"
-            and self._mode == FanMode.AUTO.value
-            and self.connector.drac_version == "idrac7"
-        )
-
-        if (action != "unchanged" or should_refresh_manual_override) and self._mode == FanMode.AUTO.value:
+        if apply and action != "unchanged" and self._mode == FanMode.AUTO.value:
             success = await self._apply_fan_mode("Manual", target_fan)
             if success:
                 self._current_fan_percent = target_fan
-                if action == "unchanged":
-                    logger.info(
-                        "Refreshed auto-control manual target at %s%% for %s (CPU: %s°C, Disk: %s°C, Ambient: %s°C)",
-                        self._current_fan_percent,
-                        self.connector.ip,
-                        cpu_temp,
-                        disk_temp,
-                        ambient_temp,
-                    )
-                else:
-                    logger.info(
-                        "Fan speed %s: %s%% (CPU: %s°C, Disk: %s°C, Ambient: %s°C)",
-                        action,
-                        self._current_fan_percent,
-                        cpu_temp,
-                        disk_temp,
-                        ambient_temp,
-                    )
+                logger.info(
+                    "Fan speed %s: %s%% (CPU: %s°C, Disk: %s°C, Ambient: %s°C)",
+                    action, self._current_fan_percent, cpu_temp, disk_temp, ambient_temp,
+                )
             else:
                 logger.warning("Failed to apply fan speed change to %s%%", target_fan)
 
