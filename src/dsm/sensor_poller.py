@@ -145,6 +145,32 @@ class SensorPoller:
         history.append((sample_at, current))
         return rates
 
+    @staticmethod
+    def _is_emergency_cpu_rise(
+        controller: FanController,
+        temperatures: list[Any],
+        profile_ranges: list[Any],
+        temperature_rates: dict[str, float],
+    ) -> bool:
+        """Return whether CPU heat may safely bypass the normal command dwell.
+
+        A controller-reported CPU temperature must be substantially above its
+        resolved limit, or its monotonic derivative must show a very rapid
+        positive rise.  The derivative is already discarded after an invalid
+        or overlong sample gap by ``_temperature_rates``.
+        """
+        for sensor in temperatures:
+            if FanController._classify_temp(sensor) != "cpu":
+                continue
+            _, maximum = controller._thresholds_for_sensor(sensor, profile_ranges)
+            rate = temperature_rates.get(FanController.sensor_key(sensor), 0.0)
+            if (
+                sensor.value_celsius > maximum + settings.fan_control_emergency_cpu_overtemp_c
+                or rate >= settings.fan_control_emergency_cpu_rate_c_per_sec
+            ):
+                return True
+        return False
+
     async def _maybe_auto_control_fans(
         self,
         session: AsyncSession,
@@ -164,9 +190,12 @@ class SensorPoller:
         inventory_fan_percent = self._current_fan_percent_from_inventory(sensor_data.fans)
         if inventory_fan_percent is not None:
             self._last_observed_fan_percent[server.id] = inventory_fan_percent
-        # A successful command is the control baseline until it is replaced by
-        # another successful command.  iDRAC PWM telemetry may be stale while
-        # a manual target is taking effect, and must not regress the next rise.
+        # A successful command is normally the control baseline until it is
+        # replaced by another successful command.  iDRAC PWM telemetry may be
+        # stale while a manual target is taking effect, so cool/steady control
+        # retains that authority.  A hot or rising cycle is different: a
+        # higher usable controller PWM is a safety floor and must never be
+        # followed by a lower manual command.
         current_fan_percent = (
             self._last_fan_control_target.get(server.id)
             if server.id in self._last_fan_control_target
@@ -194,14 +223,48 @@ class SensorPoller:
             sensor_data=sensor_data,
             current_fan_percent=current_fan_percent,
             profile_ranges=profile_ranges,
+            # ``control_cycle`` keeps its legacy 3% default for direct
+            # callers.  The production poller uses its configured bounded
+            # rise limit instead.
+            step_percent=None,
             temperature_rates=temperature_rates,
             apply=False,
         )
+        if (
+            result.action_taken == "increased"
+            and inventory_fan_percent is not None
+            and inventory_fan_percent > current_fan_percent
+        ):
+            # The first pass established that the thermal policy requires a
+            # rise.  Recalculate from the observed duty so the command is at
+            # least the current hardware PWM, while retaining the cached
+            # command as authority for cool or steady cycles.
+            current_fan_percent = inventory_fan_percent
+            controller._current_fan_percent = current_fan_percent
+            result = await controller.control_cycle(
+                sensor_data=sensor_data,
+                current_fan_percent=current_fan_percent,
+                profile_ranges=profile_ranges,
+                step_percent=None,
+                temperature_rates=temperature_rates,
+                apply=False,
+            )
+        emergency_rise = (
+            result.action_taken == "increased"
+            and self._is_emergency_cpu_rise(
+                controller,
+                sensor_data.temperatures,
+                profile_ranges,
+                temperature_rates,
+            )
+        )
         # Polling can be much faster than a chassis can react.  Do not issue
-        # another automatic command until the configured dwell has elapsed.
+        # another automatic command until the configured dwell has elapsed,
+        # except for a severe or rapidly rising CPU temperature.
         last_command = self._last_fan_control_at.get(server.id)
         if (
             result.action_taken in {"increased", "decreased"}
+            and not emergency_rise
             and last_command is not None
             and (now - last_command).total_seconds() < settings.fan_control_min_command_interval_seconds
         ):
@@ -400,14 +463,16 @@ class SensorPoller:
                 )
 
     async def _refresh_auto_control_targets_once(self):
-        """Re-assert low-speed auto targets on IPMI-backed iDRAC7 systems.
+        """Re-assert low-speed auto targets on iDRAC7 IPMI paths.
 
         Some IPMI fan-control paths accept the requested duty cycle but let it
         drift upward again if the manual target is not refreshed periodically.
         When auto control has already decided on a target and cached it in
         ``_last_fan_control_target``, keep sending that same target on a shorter
         cadence than the main sensor poll so cool systems can continue easing
-        down toward the configured floor.
+        down toward the configured floor.  After a process restart, seed that
+        target from usable PWM observed by the next sensor poll, then use the
+        same cadence instead of reapplying it on every poll.
         """
         async with async_session() as session:
             result = await session.execute(
@@ -422,21 +487,27 @@ class SensorPoller:
 
         for server, config in rows:
             target = self._last_fan_control_target.get(server.id)
-            if target is None:
-                continue
             connector = await self._get_connector(server)
             if connector is None:
                 continue
-            if getattr(connector, "_fan_control_backend", None) != "ipmi":
+            if (
+                connector.drac_version != "idrac7"
+                and getattr(connector, "_fan_control_backend", None) != "ipmi"
+            ):
                 continue
             now = datetime.now(timezone.utc)
             last_refresh = self._last_auto_refresh_at.get(server.id)
             if last_refresh and (now - last_refresh).total_seconds() < settings.fan_control_idrac7_refresh_interval_seconds:
                 continue
+            if target is None:
+                target = self._last_observed_fan_percent.get(server.id)
+                if target is None:
+                    continue
             controller = FanController(connector=connector, fan_min=7)
             controller._mode = FanMode.AUTO.value
             success = await controller._apply_fan_mode("Manual", target)
             if success:
+                self._last_fan_control_target[server.id] = target
                 self._last_auto_refresh_at[server.id] = now
                 logger.info(
                     "Refreshed auto fan target for %s at %s%%",

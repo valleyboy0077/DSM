@@ -94,7 +94,7 @@ async def test_auto_control_uses_successful_command_target_not_stale_observed_pw
 
 
 @pytest.mark.asyncio
-async def test_auto_control_steps_up_from_observed_pwm_when_cached_target_is_lower(monkeypatch):
+async def test_hot_auto_control_never_commands_below_higher_observed_pwm(monkeypatch):
     poller = SensorPoller()
     connector = FakeConnector()
     server = types.SimpleNamespace(id=1)
@@ -120,9 +120,9 @@ async def test_auto_control_steps_up_from_observed_pwm_when_cached_target_is_low
 
     result = await poller._maybe_auto_control_fans(FakeSession(fan_config), server, connector, sensor_data)
 
-    assert result["current_fan_percent"] == 14
-    assert result["target_fan_percent"] == 17
-    assert connector.calls == [("Manual", 17)]
+    assert result["current_fan_percent"] == 27
+    assert result["target_fan_percent"] >= 27
+    assert connector.calls == [("Manual", result["target_fan_percent"])]
 
 
 @pytest.mark.asyncio
@@ -248,6 +248,43 @@ async def test_auto_keepalive_refreshes_cached_ipmi_target(monkeypatch):
     assert connector.calls == [('Manual', 7)]
 
 
+@pytest.mark.asyncio
+async def test_auto_keepalive_seeds_observed_pwm_after_restart_without_churn(monkeypatch):
+    poller = SensorPoller()
+    connector = FakeConnector()
+    connector.drac_version = "idrac7"
+    # Simulates the fresh poller state after restart, populated by its first
+    # successful sensor poll before the keepalive loop runs.
+    poller._last_observed_fan_percent[1] = 27
+
+    server = types.SimpleNamespace(id=1, name="R730xd")
+    config = types.SimpleNamespace(auto_control=True, mode="auto")
+
+    class FakeSessionForRows:
+        async def execute(self, query):
+            return types.SimpleNamespace(all=lambda: [(server, config)])
+
+    class FakeSessionContext:
+        async def __aenter__(self):
+            return FakeSessionForRows()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr("dsm.sensor_poller.async_session", lambda: FakeSessionContext())
+
+    async def fake_get_connector(_server):
+        return connector
+
+    monkeypatch.setattr(poller, "_get_connector", fake_get_connector)
+
+    await poller._refresh_auto_control_targets_once()
+    await poller._refresh_auto_control_targets_once()
+
+    assert poller._last_fan_control_target[1] == 27
+    assert connector.calls == [("Manual", 27)]
+
+
 def test_temperature_rate_is_calculated_per_server_sensor_from_monotonic_time():
     clock = FakeMonotonicClock()
     poller = SensorPoller(monotonic_clock=clock)
@@ -311,8 +348,8 @@ async def test_rapid_cpu_rise_near_max_gets_fast_bounded_response(monkeypatch):
     )
 
     assert result["temperature_rates_c_per_sec"] == {"cpu1 temp|cpu": 1.0}
-    assert result["target_fan_percent"] == 23
-    assert connector.calls[-1] == ("Manual", 23)
+    assert result["target_fan_percent"] == 31
+    assert connector.calls[-1] == ("Manual", 31)
 
 
 @pytest.mark.asyncio
@@ -378,12 +415,13 @@ async def test_minimum_command_interval_prevents_repeat_hot_commands(monkeypatch
 
     assert result["action_taken"] == "unchanged"
     assert "Minimum automatic command interval" in result["reason"]
-    assert connector.calls == [("Manual", 30)]
+    assert connector.calls == [("Manual", 39)]
 
 
 @pytest.mark.asyncio
 async def test_heating_during_dwell_uses_last_command_not_stale_pwm(monkeypatch):
-    poller = SensorPoller()
+    clock = FakeMonotonicClock()
+    poller = SensorPoller(monotonic_clock=clock)
     connector = FakeConnector()
     server = types.SimpleNamespace(id=1)
     fan_config = types.SimpleNamespace(auto_control=True, cpu_temp_min=35.0, cpu_temp_max=70.0,
@@ -412,9 +450,43 @@ async def test_heating_during_dwell_uses_last_command_not_stale_pwm(monkeypatch)
         now=start + timedelta(seconds=settings.fan_control_min_command_interval_seconds + 1),
     )
 
-    assert first["target_fan_percent"] == 23
-    assert during_dwell["current_fan_percent"] == 23
-    assert during_dwell["target_fan_percent"] == 23
-    assert after_dwell["current_fan_percent"] == 23
-    assert after_dwell["target_fan_percent"] == 26
-    assert connector.calls == [("Manual", 23), ("Manual", 26)]
+    assert first["target_fan_percent"] == 32
+    assert during_dwell["current_fan_percent"] == 32
+    assert during_dwell["target_fan_percent"] == 32
+    assert after_dwell["current_fan_percent"] == 32
+    assert after_dwell["target_fan_percent"] == 44
+    assert connector.calls == [("Manual", 32), ("Manual", 44)]
+
+
+@pytest.mark.asyncio
+async def test_emergency_cpu_rise_bypasses_command_dwell(monkeypatch):
+    clock = FakeMonotonicClock()
+    poller = SensorPoller(monotonic_clock=clock)
+    connector = FakeConnector()
+    server = types.SimpleNamespace(id=1)
+    fan_config = types.SimpleNamespace(auto_control=True, cpu_temp_min=35.0, cpu_temp_max=70.0,
+                                       disk_temp_min=32.0, disk_temp_max=45.0)
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    async def profile_ranges(*_args):
+        return []
+
+    monkeypatch.setattr("dsm.sensor_poller.get_active_temp_profile_ranges", profile_ranges)
+    initial = types.SimpleNamespace(
+        temperatures=[TempSensor(name="CPU1 Temp", value_celsius=75.0, physical_context="CPU")],
+        fans=[FanSensor(name="Fan 1", rpm=6000, member_id="Fan1", percent=20, health="OK")],
+    )
+    rapidly_rising = types.SimpleNamespace(
+        temperatures=[TempSensor(name="CPU1 Temp", value_celsius=77.0, physical_context="CPU")],
+        fans=[FanSensor(name="Fan 1", rpm=6000, member_id="Fan1", percent=20, health="OK")],
+    )
+
+    first = await poller._maybe_auto_control_fans(FakeSession(fan_config), server, connector, initial, now=start)
+    clock.value = 1
+    emergency = await poller._maybe_auto_control_fans(
+        FakeSession(fan_config), server, connector, rapidly_rising, now=start + timedelta(seconds=5)
+    )
+
+    assert first["target_fan_percent"] == 32
+    assert emergency["target_fan_percent"] == 44
+    assert connector.calls == [("Manual", 32), ("Manual", 44)]

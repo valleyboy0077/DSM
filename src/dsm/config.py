@@ -59,6 +59,12 @@ class Settings(BaseSettings):
     fan_control_max_rise_step_percent: int = 12
     fan_control_max_fall_step_percent: int = 3
     fan_control_min_command_interval_seconds: int = 15
+    # Bypass the normal command dwell only when CPU heat is clearly dangerous:
+    # either this far above its configured maximum, or rising this quickly.
+    # These deliberately conservative values still let a hot chassis respond
+    # before a short polling dwell delays the next bounded rise.
+    fan_control_emergency_cpu_overtemp_c: float = 10.0
+    fan_control_emergency_cpu_rate_c_per_sec: float = 1.0
     # Ignore a derivative after a polling outage rather than treating a large
     # elapsed interval as a weak but current thermal trend.
     fan_control_max_temperature_sample_gap_seconds: int = 120
