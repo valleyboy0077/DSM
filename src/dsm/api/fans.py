@@ -1,5 +1,6 @@
 """Fan control endpoints."""
 
+import time
 from datetime import datetime, timezone
 from typing import Any, Optional, cast
 
@@ -8,10 +9,10 @@ from pydantic import BaseModel, Field, field_serializer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from dsm.api.idrac import execute_idrac_request
 from dsm.auth import get_current_user, require_operator
 from dsm.database import get_session
 from dsm.fan_control import FanController
-from dsm.api.idrac import execute_idrac_request
 from dsm.idrac_connector import IdracConnector
 from dsm.models import FanConfig, FanMode, Server
 from dsm.temp_profile_repository import get_active_temp_profile_ranges
@@ -19,6 +20,35 @@ from dsm.temp_profile_repository import get_active_temp_profile_ranges
 router = APIRouter(prefix="/fans", tags=["fans"])
 
 DEFAULT_POLLING_SECONDS = 20
+
+
+def _clear_auto_control_runtime_state(server_id: int) -> None:
+    """Clear transient automatic state without constraining manual duty semantics."""
+    from dsm.api.sensors import poller as sensor_poller
+
+    clear_state = getattr(sensor_poller, "clear_auto_control_state", None)
+    if clear_state is not None:
+        clear_state(server_id)
+        return
+    # Keep lightweight test doubles and older pollers API-compatible.
+    for name in (
+        "_last_fan_control_target",
+        "_last_observed_fan_percent",
+        "_last_fan_control_at",
+        "_last_auto_refresh_at",
+        "_temperature_history",
+    ):
+        state = getattr(sensor_poller, name, None)
+        if state is not None:
+            state.pop(server_id, None)
+
+
+def _mark_automatic_command(server_id: int) -> None:
+    """Record a direct API automatic command using the poller's monotonic clock."""
+    from dsm.api.sensors import poller as sensor_poller
+
+    clock = getattr(sensor_poller, "_monotonic_clock", time.monotonic)
+    sensor_poller._last_fan_control_at[server_id] = clock()
 
 
 async def _normalize_fan_config(session: AsyncSession, config: FanConfig) -> FanConfig:
@@ -284,9 +314,7 @@ async def control_fans(
             success = await controller.set_manual_speed(action.speed)
             if not success:
                 raise HTTPException(status_code=500, detail="Failed to set manual fan speed")
-            from dsm.api.sensors import poller as sensor_poller
-            sensor_poller._last_fan_control_target[server_id] = controller._current_fan_percent
-            sensor_poller._last_fan_control_at.pop(server_id, None)
+            _clear_auto_control_runtime_state(server_id)
             await _persist_fan_mode(
                 session,
                 config,
@@ -310,9 +338,7 @@ async def control_fans(
             success = await controller.set_auto_mode()
             if not success:
                 raise HTTPException(status_code=500, detail="Failed to enable auto mode")
-            from dsm.api.sensors import poller as sensor_poller
-            sensor_poller._last_fan_control_target.pop(server_id, None)
-            sensor_poller._last_fan_control_at.pop(server_id, None)
+            _clear_auto_control_runtime_state(server_id)
             await _persist_fan_mode(
                 session,
                 config,
@@ -325,9 +351,7 @@ async def control_fans(
             success = await controller.reset_to_default()
             if not success:
                 raise HTTPException(status_code=500, detail="Failed to reset to default")
-            from dsm.api.sensors import poller as sensor_poller
-            sensor_poller._last_fan_control_target.pop(server_id, None)
-            sensor_poller._last_fan_control_at.pop(server_id, None)
+            _clear_auto_control_runtime_state(server_id)
             await _persist_fan_mode(
                 session,
                 config,
@@ -350,7 +374,7 @@ async def control_fans(
             )
             if result.action_taken in {"increased", "decreased"}:
                 sensor_poller._last_fan_control_target[server_id] = result.target_fan_percent
-                sensor_poller._last_fan_control_at[server_id] = datetime.now(timezone.utc)
+                _mark_automatic_command(server_id)
             return {
                 "status": "ok",
                 "fan_percent": result.target_fan_percent,

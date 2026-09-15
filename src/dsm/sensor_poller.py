@@ -18,7 +18,7 @@ from dsm.config import settings
 from dsm.database import async_session
 from dsm.fan_control import FanController, FanControlTuning
 from dsm.idrac_connector import IdracConnector, IdracError
-from dsm.models import FanConfig, FanMode, Server, ServerStatus, SensorReading
+from dsm.models import FanConfig, FanMode, SensorReading, Server, ServerStatus
 from dsm.temp_profile_repository import get_active_temp_profile_ranges
 
 logger = logging.getLogger(__name__)
@@ -37,8 +37,9 @@ class SensorPoller:
         self._task: Optional[asyncio.Task] = None
         self._manual_override_task: Optional[asyncio.Task] = None
         self._connectors: dict = {}  # server_id -> IdracConnector
-        self._last_fan_control_at: dict[int, datetime] = {}
-        self._last_auto_refresh_at: dict[int, datetime] = {}
+        # Automatic cadence must not be affected by wall-clock adjustments.
+        self._last_fan_control_at: dict[int, float] = {}
+        self._last_auto_refresh_at: dict[int, float] = {}
         self._monotonic_clock = monotonic_clock
         # Last two monotonic-time readings per server, keyed by physical sensor.
         self._temperature_history: dict[int, deque[tuple[float, dict[str, float]]]] = {}
@@ -50,6 +51,14 @@ class SensorPoller:
         # command target for telemetry and diagnostics.
         self._last_observed_fan_percent: dict[int, int] = {}
         self._websocket_clients: list = []  # WebSocket for real-time updates
+
+    def clear_auto_control_state(self, server_id: int) -> None:
+        """Forget automatic-control state after an operator mode transition."""
+        self._last_fan_control_target.pop(server_id, None)
+        self._last_observed_fan_percent.pop(server_id, None)
+        self._last_fan_control_at.pop(server_id, None)
+        self._last_auto_refresh_at.pop(server_id, None)
+        self._temperature_history.pop(server_id, None)
 
     def add_websocket_client(self, ws):
         """Register a WebSocket client for real-time sensor updates."""
@@ -165,7 +174,7 @@ class SensorPoller:
             _, maximum = controller._thresholds_for_sensor(sensor, profile_ranges)
             rate = temperature_rates.get(FanController.sensor_key(sensor), 0.0)
             if (
-                sensor.value_celsius > maximum + settings.fan_control_emergency_cpu_overtemp_c
+                sensor.value_celsius >= maximum + settings.fan_control_emergency_cpu_overtemp_c
                 or rate >= settings.fan_control_emergency_cpu_rate_c_per_sec
             ):
                 return True
@@ -178,15 +187,21 @@ class SensorPoller:
         connector: IdracConnector,
         sensor_data,
         now: Optional[datetime] = None,
+        monotonic_now: Optional[float] = None,
     ) -> Optional[dict]:
         result = await session.execute(select(FanConfig).where(FanConfig.server_id == server.id))
         fan_config = cast(Any, result.scalars().first())
         if not fan_config or not fan_config.auto_control:
             return None
 
+        # ``now`` is retained for call compatibility.  All elapsed-time
+        # decisions below use the injectable monotonic clock instead.
         now = now or datetime.now(timezone.utc)
+        command_now = self._monotonic_clock() if monotonic_now is None else monotonic_now
         profile_ranges = await get_active_temp_profile_ranges(session, server.id)
-        temperature_rates = self._temperature_rates(server.id, sensor_data.temperatures, now)
+        temperature_rates = self._temperature_rates(
+            server.id, sensor_data.temperatures, now, monotonic_now=command_now
+        )
         inventory_fan_percent = self._current_fan_percent_from_inventory(sensor_data.fans)
         if inventory_fan_percent is not None:
             self._last_observed_fan_percent[server.id] = inventory_fan_percent
@@ -217,6 +232,7 @@ class SensorPoller:
             fan_max=100,
             tuning=self._fan_control_tuning(),
         )
+        current_fan_percent = controller._clamp_fan_percent(current_fan_percent)
         controller._mode = FanMode.AUTO.value
         controller._current_fan_percent = current_fan_percent
         result = await controller.control_cycle(
@@ -266,7 +282,7 @@ class SensorPoller:
             result.action_taken in {"increased", "decreased"}
             and not emergency_rise
             and last_command is not None
-            and (now - last_command).total_seconds() < settings.fan_control_min_command_interval_seconds
+            and command_now - last_command < settings.fan_control_min_command_interval_seconds
         ):
             result.target_fan_percent = current_fan_percent
             result.action_taken = "unchanged"
@@ -274,7 +290,7 @@ class SensorPoller:
         if result.action_taken in {"increased", "decreased"}:
             success = await controller._apply_fan_mode("Manual", result.target_fan_percent)
             if success:
-                self._last_fan_control_at[server.id] = now
+                self._last_fan_control_at[server.id] = command_now
                 self._last_fan_control_target[server.id] = result.target_fan_percent
             else:
                 result.action_taken = "unchanged"
@@ -495,9 +511,12 @@ class SensorPoller:
                 and getattr(connector, "_fan_control_backend", None) != "ipmi"
             ):
                 continue
-            now = datetime.now(timezone.utc)
+            refresh_now = self._monotonic_clock()
             last_refresh = self._last_auto_refresh_at.get(server.id)
-            if last_refresh and (now - last_refresh).total_seconds() < settings.fan_control_idrac7_refresh_interval_seconds:
+            if (
+                last_refresh is not None
+                and refresh_now - last_refresh < settings.fan_control_idrac7_refresh_interval_seconds
+            ):
                 continue
             if target is None:
                 target = self._last_observed_fan_percent.get(server.id)
@@ -505,10 +524,11 @@ class SensorPoller:
                     continue
             controller = FanController(connector=connector, fan_min=7)
             controller._mode = FanMode.AUTO.value
+            target = controller._clamp_fan_percent(target)
             success = await controller._apply_fan_mode("Manual", target)
             if success:
                 self._last_fan_control_target[server.id] = target
-                self._last_auto_refresh_at[server.id] = now
+                self._last_auto_refresh_at[server.id] = refresh_now
                 logger.info(
                     "Refreshed auto fan target for %s at %s%%",
                     server.name,
