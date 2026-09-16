@@ -5,6 +5,7 @@ src/dsm/frontend/
 __pycache__/
 *.pyc
 .env
+compose.override.yaml
 *.db
 .venv/
 *.egg-info/

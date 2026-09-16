@@ -69,6 +69,12 @@ For implementation details, see:
 
 ## Quick Start
 
+For the canonical Git → test → Docker build → Compose deploy workflow, see
+[Development](docs/development.md). Docker is the supported deployment artifact;
+deployment requirements, persistence, stopping, and rollback are documented in
+[Deployment](docs/deployment.md). Contributors should also read
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
 ```bash
 # 1. Clone and set up virtual environment
 cd dsm
@@ -92,6 +98,10 @@ cd ..
 ```
 
 ## Container deployment
+
+The short path is `make docker-build`, `make docker-config`, and `make docker-up`.
+See [docs/development.md](docs/development.md) for the complete workflow and the
+safe operator LAN override procedure.
 
 The container image builds the Vite frontend during `docker build` and serves
 the resulting assets through FastAPI. It starts Uvicorn directly; it does not
