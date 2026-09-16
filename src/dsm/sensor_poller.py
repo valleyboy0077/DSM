@@ -475,6 +475,26 @@ class SensorPoller:
                 # Fetch all thermal + fan data from iDRAC
                 sensor_data = await connector.get_sensors()
 
+                power_state = (
+                    getattr(sensor_data.system_info, "power_state", None)
+                    if sensor_data.system_info
+                    else None
+                )
+                if isinstance(power_state, str) and power_state.strip().lower() == "off":
+                    # A reachable iDRAC can still report a powered-off host.
+                    # Treat this as a failed telemetry poll so the cache keeps
+                    # last-known readings and exposes them as stale.
+                    db_server.status = ServerStatus.DEGRADED.value
+                    await session.commit()
+                    error = "Server is powered off"
+                    logger.info("Poll skipped for %s: %s", db_server.name, error)
+                    return {
+                        "status": "error",
+                        "server": db_server.name,
+                        "server_id": db_server.id,
+                        "error": error,
+                    }
+
                 # Update server status to online
                 db_server.status = ServerStatus.ONLINE.value
                 db_server.last_seen = datetime.now(timezone.utc)
