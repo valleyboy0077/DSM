@@ -2,7 +2,10 @@
 
 import os
 from pathlib import Path
+import shutil
 import subprocess
+
+import pytest
 
 
 ROOT = Path(__file__).parent
@@ -127,3 +130,93 @@ def test_docker_deploy_does_not_source_dotenv_files():
 
     assert "source .env" not in deploy_script
     assert "dotenv_value" in deploy_script
+
+
+@pytest.mark.parametrize(
+    ("password_line", "expected_password"),
+    [
+        ('"password # inside double quotes" # password comment', "password # inside double quotes"),
+        ("'password # inside single quotes' # password comment", "password # inside single quotes"),
+    ],
+)
+def test_docker_deploy_matches_compose_dotenv_comment_rules_for_required_secrets(
+    tmp_path, password_line, expected_password
+):
+    project = tmp_path / "project"
+    scripts = project / "scripts"
+    scripts.mkdir(parents=True)
+    shutil.copy2(ROOT / "scripts" / "docker-deploy.sh", scripts / "docker-deploy.sh")
+    (project / ".env").write_text(
+        "DSM_ENCRYPTION_KEY=A1b2C3d4E5f6A7b8C9d0E1f2A3b4C5d6 # key comment\n"
+        f"DSM_BOOTSTRAP_ADMIN_PASSWORD={password_line}\n"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n%s\\n" "$DSM_ENCRYPTION_KEY" "$DSM_BOOTSTRAP_ADMIN_PASSWORD" '
+        '> "$FAKE_DOCKER_VALUES"\n'
+    )
+    fake_docker.chmod(0o755)
+    values = tmp_path / "docker-values"
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "FAKE_DOCKER_VALUES": str(values),
+    }
+    environment.pop("DSM_ENCRYPTION_KEY", None)
+    environment.pop("DSM_BOOTSTRAP_ADMIN_PASSWORD", None)
+
+    result = subprocess.run(
+        [str(scripts / "docker-deploy.sh")],
+        cwd=project,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert values.read_text().splitlines() == [
+        "A1b2C3d4E5f6A7b8C9d0E1f2A3b4C5d6",
+        expected_password,
+    ]
+
+
+def test_docker_deploy_rejects_unsupported_dotenv_secret_forms_before_compose(tmp_path):
+    project = tmp_path / "project"
+    scripts = project / "scripts"
+    scripts.mkdir(parents=True)
+    shutil.copy2(ROOT / "scripts" / "docker-deploy.sh", scripts / "docker-deploy.sh")
+    (project / ".env").write_text(
+        'DSM_ENCRYPTION_KEY="A1b2C3d4E5f6A7b8C9d0E1f2A3b4C5d6" unexpected\n'
+        "DSM_BOOTSTRAP_ADMIN_PASSWORD=test-password\n"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text('#!/bin/sh\ntouch "$FAKE_DOCKER_CALLED"\n')
+    fake_docker.chmod(0o755)
+    called = tmp_path / "docker-called"
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "FAKE_DOCKER_CALLED": str(called),
+    }
+    environment.pop("DSM_ENCRYPTION_KEY", None)
+    environment.pop("DSM_BOOTSTRAP_ADMIN_PASSWORD", None)
+
+    result = subprocess.run(
+        [str(scripts / "docker-deploy.sh")],
+        cwd=project,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "DSM_ENCRYPTION_KEY in .env uses an unsupported dotenv form." in result.stderr
+    assert "A1b2C3d4E5f6A7b8C9d0E1f2A3b4C5d6" not in result.stderr
+    assert not called.exists()

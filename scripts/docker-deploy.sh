@@ -10,6 +10,8 @@ cd "$repository_root"
 dotenv_value() {
     local key="$1"
     local line value
+    local double_quoted='^"([^"\\]*)"[[:space:]]*(#.*)?$'
+    local single_quoted="^'([^'\\]*)'[[:space:]]*(#.*)?$"
     local pattern="^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=(.*)$"
 
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -17,11 +19,21 @@ dotenv_value() {
         if [[ "$line" =~ $pattern ]]; then
             value="${BASH_REMATCH[2]}"
             value="${value#"${value%%[![:space:]]*}"}"
-            value="${value%"${value##*[![:space:]]}"}"
-            if [[ "$value" == \"*\" && ${#value} -ge 2 ]]; then
-                value="${value:1:-1}"
-            elif [[ "$value" == \'*\' && ${#value} -ge 2 ]]; then
-                value="${value:1:-1}"
+            if [[ "$value" == \"* ]]; then
+                # Hashes within quotes are values; comments may follow the quote.
+                # Escaped or multiline quotes are rejected rather than misparsed.
+                [[ "$value" =~ $double_quoted ]] || return 2
+                value="${BASH_REMATCH[1]}"
+            elif [[ "$value" == \'* ]]; then
+                [[ "$value" =~ $single_quoted ]] || return 2
+                value="${BASH_REMATCH[1]}"
+            elif [[ "$value" =~ ^[[:space:]]*# ]]; then
+                value=""
+            elif [[ "$value" =~ ^(.*[^[:space:]])[[:space:]]+#.*$ ]]; then
+                # An unquoted hash starts a comment only after whitespace.
+                value="${BASH_REMATCH[1]}"
+            else
+                value="${value%"${value##*[![:space:]]}"}"
             fi
             printf '%s' "$value"
             return 0
@@ -31,12 +43,28 @@ dotenv_value() {
     return 1
 }
 
+load_dotenv_secret() {
+    local name="$1"
+    local value status
+
+    if value="$(dotenv_value "$name")"; then
+        export "$name=$value"
+        return
+    else
+        status=$?
+        if (( status == 2 )); then
+            printf '%s in .env uses an unsupported dotenv form.\n' "$name" >&2
+            exit 1
+        fi
+    fi
+}
+
 if [[ -f .env ]]; then
     if [[ -z "${DSM_ENCRYPTION_KEY-}" ]]; then
-        export DSM_ENCRYPTION_KEY="$(dotenv_value DSM_ENCRYPTION_KEY || true)"
+        load_dotenv_secret DSM_ENCRYPTION_KEY
     fi
     if [[ -z "${DSM_BOOTSTRAP_ADMIN_PASSWORD-}" ]]; then
-        export DSM_BOOTSTRAP_ADMIN_PASSWORD="$(dotenv_value DSM_BOOTSTRAP_ADMIN_PASSWORD || true)"
+        load_dotenv_secret DSM_BOOTSTRAP_ADMIN_PASSWORD
     fi
 fi
 
