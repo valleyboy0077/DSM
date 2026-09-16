@@ -45,7 +45,12 @@ async def lifespan(app: FastAPI):
     # Seed default data
     async with async_session() as session:
         await seed_default_roles(session)
-        await seed_default_admin(session)
+        await seed_default_admin(
+            session,
+            username=settings.bootstrap_admin_username,
+            password=settings.bootstrap_admin_password,
+            email=settings.bootstrap_admin_email,
+        )
 
     # Start sensor poller
     await poller.start()

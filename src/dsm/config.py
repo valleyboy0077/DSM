@@ -84,6 +84,13 @@ class Settings(BaseSettings):
     # Must be 32 hex characters (16 bytes). Change this in production!
     encryption_key: str = "00000000000000000000000000000000"
 
+    # Initial administrator. Container deployments require an explicit password
+    # for an empty database; local development keeps its historical default.
+    require_bootstrap_admin: bool = False
+    bootstrap_admin_username: str = "admin"
+    bootstrap_admin_password: str | None = None
+    bootstrap_admin_email: str = "admin@localhost"
+
     # iDRAC defaults
     drac_default_user: str = "root"
     drac_webui_port: int = 443

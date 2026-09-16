@@ -4,7 +4,8 @@
 FROM node:22-bookworm-slim AS frontend-build
 WORKDIR /app
 COPY frontend/package.json ./frontend/package.json
-RUN cd frontend && npm install
+COPY frontend/package-lock.json ./frontend/package-lock.json
+RUN cd frontend && npm ci
 COPY frontend ./frontend
 COPY src/dsm ./src/dsm
 RUN cd frontend && npm run build
@@ -22,7 +23,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app/src \
     DSM_DB_PATH=/var/lib/dsm/dsm.db \
     DSM_HOST=0.0.0.0 \
-    DSM_PORT=8080
+    DSM_PORT=8080 \
+    DSM_REQUIRE_BOOTSTRAP_ADMIN=true
 
 RUN addgroup --system dsm && adduser --system --ingroup dsm --home /app dsm
 WORKDIR /app

@@ -153,13 +153,21 @@ async def seed_default_roles(session: AsyncSession):
 async def seed_default_admin(
     session: AsyncSession,
     username: str = "admin",
-    password: str = "admin",
+    password: str | None = None,
     email: str = "admin@localhost",
 ):
-    """Create a default admin user if none exists."""
+    """Create the initial admin user if no users exist."""
     existing = await session.execute(select(User))
     if existing.scalars().first():
         return
+
+    if password is None:
+        if settings.require_bootstrap_admin:
+            raise RuntimeError(
+                "DSM_BOOTSTRAP_ADMIN_PASSWORD must be set when "
+                "DSM_REQUIRE_BOOTSTRAP_ADMIN is true"
+            )
+        password = "admin"
 
     from dsm.crypto import encrypt_plaintext
 
@@ -183,4 +191,4 @@ async def seed_default_admin(
         session.add(UserRole(user_id=admin.id, role_id=role.id))
         await session.commit()
 
-    logger.info(f"Default admin user created: {username}")
+    logger.info("Bootstrap admin user created: %s", username)

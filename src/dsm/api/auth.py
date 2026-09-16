@@ -97,7 +97,12 @@ async def login(data: LoginRequest, session: AsyncSession = Depends(get_session)
     """Authenticate user and return JWT token."""
     # Seed defaults on first login
     await seed_default_roles(session)
-    await seed_default_admin(session)
+    await seed_default_admin(
+        session,
+        username=settings.bootstrap_admin_username,
+        password=settings.bootstrap_admin_password,
+        email=settings.bootstrap_admin_email,
+    )
 
     result = await session.execute(select(User).where(User.username == data.username))
     user = result.scalars().first()
