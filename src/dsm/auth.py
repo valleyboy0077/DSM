@@ -161,12 +161,13 @@ async def seed_default_admin(
     if existing.scalars().first():
         return
 
+    if settings.require_bootstrap_admin and (password is None or not password.strip()):
+        raise RuntimeError(
+            "DSM_BOOTSTRAP_ADMIN_PASSWORD must be set when "
+            "DSM_REQUIRE_BOOTSTRAP_ADMIN is true"
+        )
+
     if password is None:
-        if settings.require_bootstrap_admin:
-            raise RuntimeError(
-                "DSM_BOOTSTRAP_ADMIN_PASSWORD must be set when "
-                "DSM_REQUIRE_BOOTSTRAP_ADMIN is true"
-            )
         password = "admin"
 
     from dsm.crypto import encrypt_plaintext
