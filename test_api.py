@@ -2,6 +2,7 @@
 """API integration test — matches actual endpoints."""
 import httpx
 import json
+from test_api_flow import create_server, delete_created_server
 
 BASE = "http://127.0.0.1:8080"
 errors = []
@@ -39,114 +40,118 @@ r = client.get("/fans/1")
 check("Fans requires auth", r.status_code == 401)
 
 # 5. Add server
-r = client.post("/servers/", json={
+created_server = create_server(client, {
     "name": "R730xd-Test",
     "ipmi_ip": "10.1.1.109",
     "ipmi_user": "ned",
     "ipmi_password": "Nclaw!",
-}, headers=headers)
-check("Add server", r.status_code == 201)
-server_id = r.json().get("id", 1)
+}, headers)
+check("Add server", created_server is not None)
+if created_server is None:
+    print("Skipping server-dependent checks and cleanup: server creation failed")
+    client.close()
+    exit(1)
+server_id = created_server.id
 
-# 6. List servers
-r = client.get("/servers/", headers=headers)
-check("List servers", r.status_code == 200 and len(r.json()) >= 1)
+try:
+    # 6. List servers
+    r = client.get("/servers/", headers=headers)
+    check("List servers", r.status_code == 200 and len(r.json()) >= 1)
 
-# 7. Get server details
-r = client.get(f"/servers/{server_id}", headers=headers)
-check("Get server", r.status_code == 200)
+    # 7. Get server details
+    r = client.get(f"/servers/{server_id}", headers=headers)
+    check("Get server", r.status_code == 200)
 
-# 8. Sensors (need to wait for poller)
-import time
-time.sleep(8)
-r = client.get("/sensors/", headers=headers)
-check("Sensors endpoint", r.status_code == 200)
+    # 8. Sensors (need to wait for poller)
+    import time
+    time.sleep(8)
+    r = client.get("/sensors/", headers=headers)
+    check("Sensors endpoint", r.status_code == 200)
 
-r = client.get(f"/sensors/latest?server_id={server_id}", headers=headers)
-check("Latest sensors", r.status_code == 200)
+    r = client.get(f"/sensors/latest?server_id={server_id}", headers=headers)
+    check("Latest sensors", r.status_code == 200)
 
-r = client.get(f"/sensors/summary/{server_id}", headers=headers)
-check("Sensor summary", r.status_code == 200)
+    r = client.get(f"/sensors/summary/{server_id}", headers=headers)
+    check("Sensor summary", r.status_code == 200)
 
-# 9. Fans
-r = client.get(f"/fans/{server_id}", headers=headers)
-check("Get fan config", r.status_code == 200)
-fan_mode = r.json().get("mode", "")
-check("Fan mode default is auto", fan_mode == "auto")
-check("Fan polling default is 20", r.json().get("polling_seconds") == 20)
+    # 9. Fans
+    r = client.get(f"/fans/{server_id}", headers=headers)
+    check("Get fan config", r.status_code == 200)
+    fan_mode = r.json().get("mode", "")
+    check("Fan mode default is auto", fan_mode == "auto")
+    check("Fan polling default is 20", r.json().get("polling_seconds") == 20)
 
-# 10. Update fan config
-r = client.put(f"/fans/{server_id}", json={
-    "mode": "auto",
-    "cpu_temp_min": 48,
-    "cpu_temp_max": 72,
-}, headers=headers)
-check("Update fan config", r.status_code == 200)
-check("Fan mode after update", r.json().get("mode") == "auto")
+    # 10. Update fan config
+    r = client.put(f"/fans/{server_id}", json={
+        "mode": "auto",
+        "cpu_temp_min": 48,
+        "cpu_temp_max": 72,
+    }, headers=headers)
+    check("Update fan config", r.status_code == 200)
+    check("Fan mode after update", r.json().get("mode") == "auto")
 
-# 11. Settings endpoints (sub-routes)
-r = client.get(f"/settings/network/{server_id}", headers=headers)
-check("Settings network", r.status_code in (200, 502))  # 502 if iDRAC endpoint fails
+    # 11. Settings endpoints (sub-routes)
+    r = client.get(f"/settings/network/{server_id}", headers=headers)
+    check("Settings network", r.status_code in (200, 502))  # 502 if iDRAC endpoint fails
 
-# 12. Temp profiles (requires server_id)
-r = client.get(f"/temp-profiles/server/{server_id}", headers=headers)
-check("List temp profiles", r.status_code == 200)
+    # 12. Temp profiles (requires server_id)
+    r = client.get(f"/temp-profiles/server/{server_id}", headers=headers)
+    check("List temp profiles", r.status_code == 200)
 
-# 13. Users
-r = client.get("/users/", headers=headers)
-check("List users", r.status_code == 200 and len(r.json()) >= 1)
+    # 13. Users
+    r = client.get("/users/", headers=headers)
+    check("List users", r.status_code == 200 and len(r.json()) >= 1)
 
-# 14. Groups
-r = client.get("/groups/", headers=headers)
-check("List groups", r.status_code == 200)
+    # 14. Groups
+    r = client.get("/groups/", headers=headers)
+    check("List groups", r.status_code == 200)
 
-# 15. Users create (no propagation — just DSM DB)
-r = client.post("/users/", json={
-    "username": "operator1",
-    "password": "oper123456",
-    "email": "op@localhost",
-    "role": "operator",
-    "propagate_to_idrac": False,
-}, headers=headers)
-if r.status_code != 201:
-    print(f"  DEBUG create user: {r.status_code} {r.text[:200]}")
-check("Create operator user", r.status_code == 201)
+    # 15. Users create (no propagation — just DSM DB)
+    r = client.post("/users/", json={
+        "username": "operator1",
+        "password": "oper123456",
+        "email": "op@localhost",
+        "role": "operator",
+        "propagate_to_idrac": False,
+    }, headers=headers)
+    if r.status_code != 201:
+        print(f"  DEBUG create user: {r.status_code} {r.text[:200]}")
+    check("Create operator user", r.status_code == 201)
 
-# 16. Propagate operator1 to iDRAC and verify privilege fields
-r = client.post("/users/1/propagate", headers=headers)
-if r.status_code != 200:
-    print(f"  DEBUG propagate: {r.status_code} {r.text[:200]}")
-check("Propagate operator1", r.status_code == 200)
-prop_data = r.json()
-check("Propagation has results", len(prop_data.get("results", [])) > 0)
-if prop_data.get("results"):
-    first_result = prop_data["results"][0]
-    check("Propagation status is success", first_result.get("status") == "success")
-    # Now verify the privilege fields are set on the iDRAC
-    r = client.get(f"/settings/idrac-users/{server_id}", headers=headers)
-    if r.status_code == 200:
-        idrac_users = r.json()
-        operator1_found = None
-        for u in idrac_users:
-            if u.get("username") == "operator1":
-                operator1_found = u
-                break
-        if operator1_found:
-            check("operator1 has LAN privilege set", operator1_found.get("lan_privilege") == "Operator")
-            check("operator1 has Serial privilege set", operator1_found.get("serial_privilege") == "Operator")
-            check("operator1 has Access set", operator1_found.get("access") == "Operator")
-            check("operator1 has RoleId set", operator1_found.get("role") == "501")
-            check("operator1 has Privileges array", len(operator1_found.get("privileges", [])) > 0)
+    # 16. Propagate operator1 to iDRAC and verify privilege fields
+    r = client.post("/users/1/propagate", headers=headers)
+    if r.status_code != 200:
+        print(f"  DEBUG propagate: {r.status_code} {r.text[:200]}")
+    check("Propagate operator1", r.status_code == 200)
+    prop_data = r.json()
+    check("Propagation has results", len(prop_data.get("results", [])) > 0)
+    if prop_data.get("results"):
+        first_result = prop_data["results"][0]
+        check("Propagation status is success", first_result.get("status") == "success")
+        # Now verify the privilege fields are set on the iDRAC
+        r = client.get(f"/settings/idrac-users/{server_id}", headers=headers)
+        if r.status_code == 200:
+            idrac_users = r.json()
+            operator1_found = None
+            for u in idrac_users:
+                if u.get("username") == "operator1":
+                    operator1_found = u
+                    break
+            if operator1_found:
+                check("operator1 has LAN privilege set", operator1_found.get("lan_privilege") == "Operator")
+                check("operator1 has Serial privilege set", operator1_found.get("serial_privilege") == "Operator")
+                check("operator1 has Access set", operator1_found.get("access") == "Operator")
+                check("operator1 has RoleId set", operator1_found.get("role") == "501")
+                check("operator1 has Privileges array", len(operator1_found.get("privileges", [])) > 0)
+            else:
+                check("operator1 found in iDRAC users", False)
+                print(f"  DEBUG iDRAC users: {json.dumps(idrac_users, indent=2)}")
         else:
-            check("operator1 found in iDRAC users", False)
-            print(f"  DEBUG iDRAC users: {json.dumps(idrac_users, indent=2)}")
-    else:
-        print(f"  DEBUG list iDRAC users: {r.status_code} {r.text[:200]}")
-        check("List iDRAC users", False)
-
-# 16. Delete server
-r = client.delete(f"/servers/{server_id}", headers=headers)
-check("Delete server", r.status_code == 204)
+            print(f"  DEBUG list iDRAC users: {r.status_code} {r.text[:200]}")
+            check("List iDRAC users", False)
+finally:
+    r = delete_created_server(client, created_server, headers)
+    check("Delete server", r is not None and r.status_code == 204)
 
 # 17. Verify iDRAC data (from DB)
 r = client.get(f"/servers/{server_id}", headers=headers)

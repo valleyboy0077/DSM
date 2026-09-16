@@ -73,6 +73,130 @@ class PollServerSessionContext:
         return False
 
 
+class PersistingPollSession:
+    def __init__(self, server):
+        self.server = server
+        self.readings = []
+        self.commits = 0
+
+    async def get(self, _model, _server_id):
+        return self.server
+
+    def add(self, reading):
+        self.readings.append(reading)
+
+    async def commit(self):
+        self.commits += 1
+
+    async def rollback(self):
+        raise AssertionError("null temperature reading must not fail the poll")
+
+
+class PersistingPollSessionContext:
+    def __init__(self, session):
+        self.session = session
+
+    async def __aenter__(self):
+        return self.session
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+@pytest.mark.asyncio
+async def test_poll_server_skips_null_temperature_readings_without_marking_server_offline(monkeypatch):
+    poller = SensorPoller()
+    server = types.SimpleNamespace(id=2, name="R720XD")
+    session = PersistingPollSession(server)
+    sensor_data = types.SimpleNamespace(
+        system_info=None,
+        temperatures=[
+            TempSensor(name="CPU1 Temp", value_celsius=51.0, physical_context="CPU"),
+            TempSensor(name="Exhaust Temp", value_celsius=None, physical_context="SystemBoard"),
+        ],
+        fans=[],
+    )
+
+    class Connector:
+        async def get_sensors(self):
+            return sensor_data
+
+    async def get_connector(_server):
+        return Connector()
+
+    fan_control_inputs = []
+
+    async def no_fan_control(*args):
+        fan_control_inputs.append(args[3].temperatures)
+        return None
+
+    monkeypatch.setattr(poller, "_get_connector", get_connector)
+    monkeypatch.setattr(
+        "dsm.sensor_poller.async_session", lambda: PersistingPollSessionContext(session)
+    )
+    monkeypatch.setattr(poller, "_maybe_auto_control_fans", no_fan_control)
+
+    result = await poller.poll_server(server)
+
+    assert result["status"] == "ok"
+    assert server.status == "online"
+    assert [reading.value for reading in session.readings] == [51.0]
+    assert [reading["value"] for reading in result["temperatures"]] == [51.0]
+    assert fan_control_inputs == [[sensor_data.temperatures[0]]]
+    assert session.commits == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stored_profile", "expected_profile"),
+    [("idrac8", "idrac8"), ("unknown", "idrac7")],
+)
+async def test_poll_server_preserves_explicit_control_profile_and_detects_unknown(
+    monkeypatch, stored_profile, expected_profile
+):
+    poller = SensorPoller()
+    server = types.SimpleNamespace(
+        id=3,
+        name="R720XD",
+        drac_version=stored_profile,
+        status="unknown",
+        model=None,
+        serial=None,
+    )
+    session = PersistingPollSession(server)
+    sensor_data = types.SimpleNamespace(
+        system_info=types.SimpleNamespace(
+            model="PowerEdge R720XD",
+            service_tag="service-tag",
+            drac_version="idrac7",
+            power_state="On",
+        ),
+        temperatures=[],
+        fans=[],
+    )
+
+    class Connector:
+        async def get_sensors(self):
+            return sensor_data
+
+    async def get_connector(_server):
+        return Connector()
+
+    async def no_fan_control(*_args):
+        return None
+
+    monkeypatch.setattr(poller, "_get_connector", get_connector)
+    monkeypatch.setattr(
+        "dsm.sensor_poller.async_session", lambda: PersistingPollSessionContext(session)
+    )
+    monkeypatch.setattr(poller, "_maybe_auto_control_fans", no_fan_control)
+
+    result = await poller.poll_server(server)
+
+    assert result["status"] == "ok"
+    assert server.drac_version == expected_profile
+
+
 @pytest.mark.asyncio
 async def test_poll_all_caches_normalized_snapshot_and_broadcasts_versioned_event(monkeypatch):
     poller = SensorPoller()
