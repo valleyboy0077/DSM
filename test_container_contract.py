@@ -39,3 +39,24 @@ def test_example_environment_contains_only_a_placeholder_encryption_key():
     assert "DSM_ENCRYPTION_KEY=replace_with_" in example
     assert "DSM_BOOTSTRAP_ADMIN_PASSWORD=replace_with_" in example
     assert "00000000000000000000000000000000" not in example
+
+
+def test_docker_development_contract_uses_wrappers_and_keeps_lan_override_untracked():
+    makefile = (ROOT / "Makefile").read_text()
+    build_script = (ROOT / "scripts" / "docker-build.sh").read_text()
+    deploy_script = (ROOT / "scripts" / "docker-deploy.sh").read_text()
+    gitignore = (ROOT / ".gitignore").read_text()
+    lan_override = (ROOT / "compose.lan.yaml.example").read_text()
+
+    for target in ("test", "docker-build", "docker-config", "docker-up", "docker-down", "docker-logs"):
+        assert f"{target}:" in makefile
+    assert "./scripts/docker-build.sh" in makefile
+    assert "./scripts/docker-deploy.sh" in makefile
+    assert "docker compose config" in makefile
+    assert "docker build --file Dockerfile" in build_script
+    assert "DSM_ENCRYPTION_KEY" in deploy_script
+    assert "DSM_BOOTSTRAP_ADMIN_PASSWORD" in deploy_script
+    assert "docker compose up --build --detach" in deploy_script
+    assert "compose.override.yaml" in gitignore
+    assert "ports: !override" in lan_override
+    assert '"0.0.0.0:8080:8080"' in lan_override

@@ -1,0 +1,10 @@
+# Copy to compose.override.yaml (which is ignored by Git) only when DSM must be
+# reachable on a trusted LAN. Restrict access with a firewall or reverse proxy.
+services:
+  dsm:
+    # Compose 2.24.4+ is required for !override to replace, rather than append
+    # to, the safe loopback bindings in compose.yaml.
+    ports: !override
+      - "0.0.0.0:8080:8080"
+      # Do not publish the MCP port to an untrusted network.
+      # - "0.0.0.0:8101:8101"
