@@ -18,6 +18,7 @@ from dsm.auth import (
     seed_default_admin,
 )
 from dsm.crypto import encrypt_plaintext
+from dsm.config import settings
 from dsm.database import get_session
 from dsm.models import User, Role, UserRole
 
