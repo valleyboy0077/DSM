@@ -482,7 +482,15 @@ class SensorPoller:
                 if sensor_data.system_info:
                     db_server.model = sensor_data.system_info.model or db_server.model
                     db_server.serial = sensor_data.system_info.service_tag or db_server.serial
-                    db_server.drac_version = sensor_data.system_info.drac_version
+                    if db_server.drac_version not in {"idrac7", "idrac8"}:
+                        db_server.drac_version = sensor_data.system_info.drac_version
+
+                # Powered-off systems can report temperature inventory entries
+                # without numeric values.  Keep those entries out of both the
+                # NOT NULL persistence column and downstream fan calculations.
+                sensor_data.temperatures = [
+                    temp for temp in sensor_data.temperatures if temp.value_celsius is not None
+                ]
 
                 # Store each temperature reading
                 for temp in sensor_data.temperatures:
