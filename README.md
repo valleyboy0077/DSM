@@ -105,7 +105,8 @@ cd dsm
 # 2. Supply the encryption key outside Git. It must be a unique 32-character
 #    hexadecimal key; do not use the placeholder below as a real key.
 cp .env.example .env
-# Edit .env locally and set DSM_ENCRYPTION_KEY to a real value.
+# Edit .env locally and set DSM_ENCRYPTION_KEY and
+# DSM_BOOTSTRAP_ADMIN_PASSWORD to real, unique values.
 
 # 3. Build and start DSM in the background
 docker compose up --build -d
@@ -115,17 +116,30 @@ curl http://127.0.0.1:8080/health
 docker compose logs -f dsm
 ```
 
-The application is available on `http://127.0.0.1:8080`; MCP is exposed on
-port `8101`. Compose stores SQLite at `/var/lib/dsm/dsm.db` in the named
-`dsm_data` volume, so data survives recreating the container. Stop it with
+The application and MCP endpoint are bound to loopback by default:
+`http://127.0.0.1:8080` and `http://127.0.0.1:8101/mcp`. Compose stores SQLite
+at `/var/lib/dsm/dsm.db` in the named `dsm_data` volume, so data survives
+recreating the container. Stop it with
 `docker compose down`; include `--volumes` only when intentionally discarding
 the persisted database.
 
 The Compose environment explicitly sets `DSM_DB_PATH`, `DSM_ENCRYPTION_KEY`,
-`DSM_HOST`, `DSM_PORT`, `DSM_DEBUG`, `DSM_MCP_ENABLED`, and `DSM_MCP_PORT`.
-`DSM_ENCRYPTION_KEY` is required from the untracked `.env` file. Never commit a
-real key, and preserve the same key for as long as encrypted stored passwords
-must remain readable.
+`DSM_HOST`, `DSM_PORT`, `DSM_DEBUG`, `DSM_MCP_ENABLED`, `DSM_MCP_PORT`, and
+the bootstrap-admin variables. `DSM_ENCRYPTION_KEY` and
+`DSM_BOOTSTRAP_ADMIN_PASSWORD` are required from the untracked `.env` file when
+the persistent volume contains no users. The password is not logged. Never
+commit real values, and preserve the same encryption key for as long as
+encrypted stored passwords must remain readable.
+
+To expose DSM remotely, keep Compose bound to loopback and put an authenticated
+TLS reverse proxy in front of it, or deliberately change the port bindings and
+restrict access with a host firewall. Do not publish the MCP port directly to
+an untrusted network.
+
+Frontend dependencies are locked in `frontend/package-lock.json` and the image
+uses `npm ci`. Python dependencies currently use lower bounds in `pyproject.toml`
+and this repository has no Python lock file, so the Python dependency resolution
+at image-build time is not fully reproducible.
 
 To publish an image after validating it locally, tag and push the image to your
 chosen registry (replace the placeholder registry path):

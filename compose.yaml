@@ -4,11 +4,15 @@ services:
       context: .
     image: dell-server-manager:local
     ports:
-      - "8080:8080"
-      - "8101:8101"
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8101:8101"
     environment:
       DSM_DB_PATH: /var/lib/dsm/dsm.db
       DSM_ENCRYPTION_KEY: ${DSM_ENCRYPTION_KEY:?DSM_ENCRYPTION_KEY must be set in .env}
+      DSM_REQUIRE_BOOTSTRAP_ADMIN: "true"
+      DSM_BOOTSTRAP_ADMIN_USERNAME: ${DSM_BOOTSTRAP_ADMIN_USERNAME:-admin}
+      DSM_BOOTSTRAP_ADMIN_PASSWORD: ${DSM_BOOTSTRAP_ADMIN_PASSWORD:?DSM_BOOTSTRAP_ADMIN_PASSWORD must be set in .env}
+      DSM_BOOTSTRAP_ADMIN_EMAIL: ${DSM_BOOTSTRAP_ADMIN_EMAIL:-admin@localhost}
       DSM_HOST: 0.0.0.0
       DSM_PORT: "8080"
       DSM_DEBUG: "false"
