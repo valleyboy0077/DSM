@@ -29,3 +29,24 @@ jobs:
         run: python -m pytest -q
       - name: Build Docker deployment artifact
         run: docker build --file Dockerfile --tag dell-server-manager:ci .
+      - name: Generate disposable Compose environment
+        run: |
+          echo "DSM_ENCRYPTION_KEY=$(openssl rand -hex 16)" >> "$GITHUB_ENV"
+          echo "DSM_BOOTSTRAP_ADMIN_PASSWORD=smoke-$(openssl rand -hex 16)" >> "$GITHUB_ENV"
+          echo "COMPOSE_PROJECT_NAME=dsm-smoke-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_ENV"
+      - name: Start disposable Compose deployment
+        run: docker compose up --build --detach
+      - name: Wait for disposable deployment health endpoint
+        run: |
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error http://127.0.0.1:8080/health; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose ps
+          docker compose logs dsm
+          exit 1
+      - name: Tear down disposable Compose deployment
+        if: always()
+        run: docker compose down --volumes --remove-orphans

@@ -118,19 +118,20 @@ cp .env.example .env
 # Edit .env locally and set DSM_ENCRYPTION_KEY and
 # DSM_BOOTSTRAP_ADMIN_PASSWORD to real, unique values.
 
-# 3. Build and start DSM in the background
-docker compose up --build -d
+# 3. Build and start DSM in the background. This validates required secrets
+#    before invoking Compose.
+make docker-up
 
 # 4. Confirm the service is healthy, then inspect logs if needed
 curl http://127.0.0.1:8080/health
-docker compose logs -f dsm
+make docker-logs
 ```
 
 The application and MCP endpoint are bound to loopback by default:
 `http://127.0.0.1:8080` and `http://127.0.0.1:8101/mcp`. Compose stores SQLite
 at `/var/lib/dsm/dsm.db` in the named `dsm_data` volume, so data survives
 recreating the container. Stop it with
-`docker compose down`; include `--volumes` only when intentionally discarding
+`make docker-down`; include `--volumes` only when intentionally discarding
 the persisted database.
 
 The Compose environment explicitly sets `DSM_DB_PATH`, `DSM_ENCRYPTION_KEY`,
