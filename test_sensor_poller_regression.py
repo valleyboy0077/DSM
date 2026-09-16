@@ -147,6 +147,60 @@ async def test_poll_server_skips_null_temperature_readings_without_marking_serve
 
 
 @pytest.mark.asyncio
+async def test_poll_server_reports_powered_off_host_without_writing_telemetry(monkeypatch):
+    poller = SensorPoller()
+    last_seen = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    server = types.SimpleNamespace(
+        id=2,
+        name="R720XD",
+        status="online",
+        last_seen=last_seen,
+        model=None,
+        serial=None,
+        drac_version="idrac7",
+    )
+    session = PersistingPollSession(server)
+    sensor_data = types.SimpleNamespace(
+        system_info=types.SimpleNamespace(power_state="Off"),
+        temperatures=[
+            TempSensor(name="CPU1 Temp", value_celsius=20.0, physical_context="CPU"),
+            TempSensor(name="Exhaust Temp", value_celsius=28.0, physical_context="SystemBoard"),
+            TempSensor(name="Inlet Temp", value_celsius=None, physical_context="SystemBoard"),
+        ],
+        fans=[],
+    )
+
+    class Connector:
+        async def get_sensors(self):
+            return sensor_data
+
+    async def get_connector(_server):
+        return Connector()
+
+    async def unexpected_fan_control(*_args):
+        raise AssertionError("fan control must not run for a powered-off host")
+
+    monkeypatch.setattr(poller, "_get_connector", get_connector)
+    monkeypatch.setattr(
+        "dsm.sensor_poller.async_session", lambda: PersistingPollSessionContext(session)
+    )
+    monkeypatch.setattr(poller, "_maybe_auto_control_fans", unexpected_fan_control)
+
+    result = await poller.poll_server(server)
+
+    assert result == {
+        "status": "error",
+        "server": "R720XD",
+        "server_id": 2,
+        "error": "Server is powered off",
+    }
+    assert server.status == "degraded"
+    assert server.last_seen == last_seen
+    assert session.readings == []
+    assert session.commits == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("stored_profile", "expected_profile"),
     [("idrac8", "idrac8"), ("unknown", "idrac7")],
