@@ -194,7 +194,7 @@ async def test_poll_server_reports_powered_off_host_without_writing_telemetry(mo
         "server_id": 2,
         "error": "Server is powered off",
     }
-    assert server.status == "degraded"
+    assert server.status == "offline"
     assert server.last_seen == last_seen
     assert session.readings == []
     assert session.commits == 1
