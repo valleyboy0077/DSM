@@ -91,6 +91,51 @@ cd ..
 ./start.sh
 ```
 
+## Container deployment
+
+The container image builds the Vite frontend during `docker build` and serves
+the resulting assets through FastAPI. It starts Uvicorn directly; it does not
+use the host `start.sh` or its `nohup` flow.
+
+```bash
+# 1. Clone the repository
+git clone <repository-url> dsm
+cd dsm
+
+# 2. Supply the encryption key outside Git. It must be a unique 32-character
+#    hexadecimal key; do not use the placeholder below as a real key.
+cp .env.example .env
+# Edit .env locally and set DSM_ENCRYPTION_KEY to a real value.
+
+# 3. Build and start DSM in the background
+docker compose up --build -d
+
+# 4. Confirm the service is healthy, then inspect logs if needed
+curl http://127.0.0.1:8080/health
+docker compose logs -f dsm
+```
+
+The application is available on `http://127.0.0.1:8080`; MCP is exposed on
+port `8101`. Compose stores SQLite at `/var/lib/dsm/dsm.db` in the named
+`dsm_data` volume, so data survives recreating the container. Stop it with
+`docker compose down`; include `--volumes` only when intentionally discarding
+the persisted database.
+
+The Compose environment explicitly sets `DSM_DB_PATH`, `DSM_ENCRYPTION_KEY`,
+`DSM_HOST`, `DSM_PORT`, `DSM_DEBUG`, `DSM_MCP_ENABLED`, and `DSM_MCP_PORT`.
+`DSM_ENCRYPTION_KEY` is required from the untracked `.env` file. Never commit a
+real key, and preserve the same key for as long as encrypted stored passwords
+must remain readable.
+
+To publish an image after validating it locally, tag and push the image to your
+chosen registry (replace the placeholder registry path):
+
+```bash
+docker compose build
+docker tag dell-server-manager:local registry.example.com/your-org/dell-server-manager:latest
+docker push registry.example.com/your-org/dell-server-manager:latest
+```
+
 ## Database migrations
 
 DSM upgrades its SQLite schema automatically during application startup. To run
