@@ -484,7 +484,7 @@ class SensorPoller:
                     # A reachable iDRAC can still report a powered-off host.
                     # Treat this as a failed telemetry poll so the cache keeps
                     # last-known readings and exposes them as stale.
-                    db_server.status = ServerStatus.DEGRADED.value
+                    db_server.status = ServerStatus.OFFLINE.value
                     await session.commit()
                     error = "Server is powered off"
                     logger.info("Poll skipped for %s: %s", db_server.name, error)
