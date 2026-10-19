@@ -144,6 +144,7 @@ class IdracConnector:
     async def _request_many(self, items) -> list[dict]:
         """Fetch multiple Redfish objects concurrently, skipping failures."""
         async def fetch_one(item) -> Optional[dict]:
+            """Fetch one link target, returning ``None`` when it is unusable."""
             path = self._odata_path(item)
             if not path:
                 return None
@@ -926,6 +927,7 @@ finally:
         role_config = role_map.get(role, role_map["ReadOnly"])
 
         def payloads(include_username: bool) -> list[dict]:
+            """Build modern and legacy account bodies in preferred order."""
             modern_payload = {
                 "Password": password,
                 "Enabled": True,
@@ -946,6 +948,7 @@ finally:
             return [modern_payload, legacy_payload]
 
         async def patch_account(account_id: str | int, include_username: bool) -> None:
+            """PATCH one account slot until a payload variant is accepted."""
             account_path = f"/redfish/v1/Managers/iDRAC.Embedded.1/Accounts/{account_id}"
             last_error: Optional[IdracError] = None
             for body in payloads(include_username):

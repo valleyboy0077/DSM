@@ -52,6 +52,7 @@ class FanControlTuning:
         span = max(0, fan_max - fan_min)
 
         def non_negative(value: object, default: float) -> float:
+            """Clamp a numeric tuning value to 0-100, falling back when invalid."""
             try:
                 parsed = float(value)
             except (TypeError, ValueError):
@@ -61,6 +62,7 @@ class FanControlTuning:
             return max(0.0, min(100.0, parsed))
 
         def step(value: object, default: int) -> int:
+            """Clamp a step size to the available fan span."""
             try:
                 parsed = int(value)
             except (TypeError, ValueError, OverflowError):

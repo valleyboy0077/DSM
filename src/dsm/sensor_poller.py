@@ -603,6 +603,7 @@ class SensorPoller:
                 semaphore = asyncio.Semaphore(settings.sensor_poll_concurrency)
 
                 async def bounded_poll(server: Server) -> dict:
+                    """Poll one server while holding a concurrency slot."""
                     async with semaphore:
                         return await self.poll_server(server)
 

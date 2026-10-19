@@ -331,6 +331,7 @@ async def control_fans(
         raise HTTPException(status_code=404, detail="Server not found")
 
     async def execute_control(connector: IdracConnector) -> dict:
+        """Run one control cycle and return the resulting fan action."""
         # Get the persisted config row so button-triggered state changes are saved.
         config = await _get_or_create_fan_config(session, server_id)
         cpu_min = config.cpu_temp_min if config else 45.0
