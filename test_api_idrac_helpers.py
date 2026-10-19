@@ -1,3 +1,5 @@
+"""Unit tests for the iDRAC helper functions shared by the API layer."""
+
 from types import SimpleNamespace
 
 import pytest

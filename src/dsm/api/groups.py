@@ -18,18 +18,21 @@ router = APIRouter(prefix="/groups", tags=["groups"])
 
 
 class GroupCreate(BaseModel):
+    """Payload for creating a server group."""
     name: str = Field(..., min_length=1, max_length=64)
     description: Optional[str] = Field(None, max_length=256)
     color: str = Field(default="#4a90d9", max_length=16)
 
 
 class GroupUpdate(BaseModel):
+    """Partial update for a server group; omitted fields are unchanged."""
     name: Optional[str] = Field(None, min_length=1, max_length=64)
     description: Optional[str] = Field(None, max_length=256)
     color: Optional[str] = Field(None, max_length=16)
 
 
 class GroupResponse(BaseModel):
+    """Server group with its member count and server identifiers."""
     id: int
     name: str
     description: Optional[str] = None
@@ -42,6 +45,7 @@ class GroupResponse(BaseModel):
 
 @router.get("/", response_model=list[GroupResponse])
 async def list_groups(_user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    """Return every server group ordered by name."""
     result = await session.execute(select(ServerGroup).order_by(ServerGroup.name))
     groups = result.scalars().all()
     response = []
@@ -56,6 +60,7 @@ async def list_groups(_user: User = Depends(get_current_user), session: AsyncSes
 
 @router.post("/", response_model=GroupResponse, status_code=201)
 async def create_group(data: GroupCreate, _admin: User = Depends(require_operator),session: AsyncSession = Depends(get_session)):
+    """Create a group; operators and admins only."""
     existing = await session.execute(select(ServerGroup).where(ServerGroup.name == data.name))
     if existing.scalars().first():
         raise HTTPException(status_code=409, detail=f"Group '{data.name}' already exists")
@@ -68,6 +73,7 @@ async def create_group(data: GroupCreate, _admin: User = Depends(require_operato
 
 @router.put("/{group_id}", response_model=GroupResponse)
 async def update_group(group_id: int, data: GroupUpdate, _admin: User = Depends(require_operator),session: AsyncSession = Depends(get_session)):
+    """Apply a partial update to an existing group."""
     group = await session.get(ServerGroup, group_id)
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
@@ -84,6 +90,7 @@ async def update_group(group_id: int, data: GroupUpdate, _admin: User = Depends(
 
 @router.delete("/{group_id}", status_code=204)
 async def delete_group(group_id: int, _admin: User = Depends(require_operator),session: AsyncSession = Depends(get_session)):
+    """Delete a group without deleting the servers it contains."""
     group = await session.get(ServerGroup, group_id)
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
@@ -93,6 +100,7 @@ async def delete_group(group_id: int, _admin: User = Depends(require_operator),s
 
 @router.post("/{group_id}/servers/{server_id}", status_code=201)
 async def add_server_to_group(group_id: int, server_id: int, _admin: User = Depends(require_operator),session: AsyncSession = Depends(get_session)):
+    """Add a server to a group, rejecting duplicates."""
     group = await session.get(ServerGroup, group_id)
     server = await session.get(Server, server_id)
     if not group or not server:
@@ -108,6 +116,7 @@ async def add_server_to_group(group_id: int, server_id: int, _admin: User = Depe
 
 @router.delete("/{group_id}/servers/{server_id}", status_code=204)
 async def remove_server_from_group(group_id: int, server_id: int, _admin: User = Depends(require_operator),session: AsyncSession = Depends(get_session)):
+    """Remove a server from a group membership."""
     stmt = server_group_members.delete().where(
         (server_group_members.c.group_id == group_id) & (server_group_members.c.server_id == server_id)
     )

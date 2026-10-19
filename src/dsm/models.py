@@ -26,13 +26,14 @@ from sqlalchemy.orm import DeclarativeBase, relationship
 
 
 class Base(DeclarativeBase):
-    pass
+    """Declarative base shared by every DSM ORM model."""
 
 
 # ─── Enums ───────────────────────────────────────────────────────────────────
 
 
 class ServerStatus(str, Enum):
+    """Reachability state derived from the most recent poll."""
     ONLINE = "online"
     OFFLINE = "offline"
     DEGRADED = "degraded"
@@ -40,18 +41,21 @@ class ServerStatus(str, Enum):
 
 
 class IdracVersion(str, Enum):
+    """DSM control profile used to route fan and power operations."""
     IDRAC7 = "idrac7"
     IDRAC8 = "idrac8"
     UNKNOWN = "unknown"
 
 
 class FanMode(str, Enum):
+    """Fan-control mode stored per server."""
     AUTO = "auto"
     MANUAL = "manual"
     PROFILE = "profile"
 
 
 class TempComponentType(str, Enum):
+    """Component classes that can carry their own temperature thresholds."""
     CPU = "cpu"
     DISK = "disk"
     AMBIENT = "ambient"
@@ -64,6 +68,7 @@ class TempComponentType(str, Enum):
 
 
 class PropagationStatus(str, Enum):
+    """Lifecycle of a user-sync attempt against one iDRAC."""
     PENDING = "pending"
     SUCCESS = "success"
     FAILED = "failed"

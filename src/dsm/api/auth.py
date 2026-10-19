@@ -31,11 +31,13 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 class LoginRequest(BaseModel):
+    """Credentials submitted to ``POST /auth/login``."""
     username: str = Field(..., min_length=1)
     password: str = Field(..., min_length=1)
 
 
 class RegisterRequest(BaseModel):
+    """Self-service account registration payload."""
     username: str = Field(..., min_length=2, max_length=64)
     email: Optional[str] = Field(None, max_length=128)
     password: str = Field(..., min_length=8)
@@ -43,11 +45,13 @@ class RegisterRequest(BaseModel):
 
 
 class ChangePasswordRequest(BaseModel):
+    """Current and replacement password for the change-password endpoint."""
     old_password: str = Field(..., min_length=1)
     new_password: str = Field(..., min_length=8)
 
 
 class TokenResponse(BaseModel):
+    """Bearer token plus the identity and roles it grants."""
     access_token: str
     token_type: str = "bearer"
     user_id: int
@@ -58,6 +62,7 @@ class TokenResponse(BaseModel):
 
 
 class UserResponse(BaseModel):
+    """Public representation of a DSM user account."""
     id: int
     username: str
     email: Optional[str] = None
@@ -71,6 +76,7 @@ class UserResponse(BaseModel):
 
     @classmethod
     def from_user(cls, user: User, roles: list[str]) -> "UserResponse":
+        """Build a response object from a persisted user and its role names."""
         return cls(
             id=user.id,
             username=user.username,

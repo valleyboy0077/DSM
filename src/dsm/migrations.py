@@ -28,6 +28,7 @@ MigrationApply = Callable[[Connection], None]
 
 @dataclass(frozen=True)
 class Migration:
+    """One ordered, idempotent schema upgrade recorded in the ledger."""
     version: int
     name: str
     apply: MigrationApply

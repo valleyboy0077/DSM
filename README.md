@@ -181,6 +181,30 @@ SQLite backup before any production deployment.
 - `src/dsm/api/` — FastAPI route modules
 - `src/dsm/mcp/` — MCP server for AI agent integration
 - `frontend/` — React + TypeScript SPA (Vite)
+- `scripts/` — Docker build/deploy wrappers and iDRAC Redfish diagnostics
+- `test_*.py` — pytest suite (run with `make test`)
+
+## Developer and Diagnostic Scripts
+
+These helpers are for local troubleshooting and never contain credentials; supply
+logins through environment variables.
+
+- `check_sensors.py` / `check_sensors.sh` — log in to a running DSM instance and
+  print the sensors, fan configuration, and server detail responses. Override the
+  target with `DSM_URL`, `DSM_USER`, `DSM_PASSWORD`, and `DSM_SERVER_ID`.
+- `debug_system_info.py` — exercise `IdracConnector` against one controller and
+  print detected version, temperature sensors, and fan readings. Requires
+  `IDRAC_HOST`, `IDRAC_USER`, and `IDRAC_PASSWORD`.
+- `scripts/idrac/` — read-only Redfish diagnostics for iDRAC account inventories
+  and schema checks, plus a guarded privilege helper
+  (`set_account_privileges.py`). All scripts read `IDRAC_HOST`, `IDRAC_USER`, and
+  `IDRAC_PASSWORD` from the environment; run them with `python scripts/idrac/<name>.py`.
+  TLS verification is disabled only for these LAN-local tools because iDRAC uses
+  self-signed certificates.
+- `scripts/docker-build.sh` and `scripts/docker-deploy.sh` — wrappers used by
+  `make docker-build` / `make docker-up`; see
+  [docs/development.md](docs/development.md), which describes the canonical
+  Docker workflow.
 
 ## Supported Controller Metadata and Profiles
 

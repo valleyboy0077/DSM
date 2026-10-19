@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 class ServerPowerState(str, Enum):
+    """Power states reported by the iDRAC ``PowerState`` property."""
     ON = "On"
     OFF = "Off"
     POWERING_ON = "PoweringOn"
@@ -121,6 +122,7 @@ class IdracConnector:
         return self._client
 
     async def close(self):
+        """Release the shared HTTP client and any cached sessions."""
         if self._client and not self._client.is_closed:
             await self._client.aclose()
             self._client = None
@@ -1320,6 +1322,7 @@ finally:
 
     @property
     def drac_version(self) -> Optional[str]:
+        """Return the cached DSM control profile, if detection has run."""
         return self._drac_version
 
 

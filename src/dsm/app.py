@@ -134,6 +134,7 @@ if os.path.isdir(frontend_dir):
 
     @app.get("/")
     async def serve_frontend():
+        """Serve the built SPA shell without browser caching after a rebuild."""
         from fastapi.responses import FileResponse
         if os.path.exists(index_path):
             # Avoid stale SPA shells after rebuilding the frontend during live DSM

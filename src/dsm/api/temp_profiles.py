@@ -19,6 +19,7 @@ router = APIRouter(prefix="/temp-profiles", tags=["temp-profiles"])
 
 
 class TempRangeCreate(BaseModel):
+    """Threshold band for one component type inside a profile."""
     component_type: str
     component_label: Optional[str] = None
     temp_min: Optional[float] = None
@@ -30,6 +31,7 @@ class TempRangeCreate(BaseModel):
 
 
 class TempProfileCreate(BaseModel):
+    """Payload for creating a temperature profile and its ranges."""
     server_id: int
     name: str = Field(default="Default", max_length=64)
     is_default: bool = False
@@ -37,6 +39,7 @@ class TempProfileCreate(BaseModel):
 
 
 class TempRangeResponse(BaseModel):
+    """Stored threshold band returned by the temp-profile API."""
     id: int
     component_type: str
     component_label: Optional[str] = None
@@ -49,6 +52,7 @@ class TempRangeResponse(BaseModel):
 
 
 class TempProfileResponse(BaseModel):
+    """Temperature profile with its component ranges and owner server."""
     id: int
     server_id: int
     server_name: Optional[str] = None

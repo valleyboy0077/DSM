@@ -1,3 +1,5 @@
+"""Regression tests for sensor polling, caching, and event fan-out."""
+
 import asyncio
 import types
 from datetime import datetime, timedelta, timezone

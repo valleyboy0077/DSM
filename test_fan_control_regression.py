@@ -1,3 +1,5 @@
+"""Regression tests for fan-control routing, clamping, and safety behaviour."""
+
 import json
 import os
 import xml.etree.ElementTree as ET

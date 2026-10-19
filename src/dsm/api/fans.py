@@ -127,6 +127,7 @@ async def _persist_fan_mode(
 
 
 class FanConfigCreate(BaseModel):
+    """Validated fan-control settings accepted when updating a server profile."""
     mode: str = Field(default=FanMode.AUTO.value, pattern="^(auto|manual|profile)$")
     cpu_temp_min: float = Field(default=45.0, ge=20.0, le=80.0)
     cpu_temp_max: float = Field(default=70.0, ge=40.0, le=95.0)
@@ -138,6 +139,7 @@ class FanConfigCreate(BaseModel):
 
 
 class FanConfigResponse(BaseModel):
+    """Stored fan-control settings for one server, with the current target."""
     id: int
     server_id: int
     mode: str
@@ -153,17 +155,20 @@ class FanConfigResponse(BaseModel):
 
     @field_serializer("updated_at")
     def serialize_updated_at(self, value: datetime | None, _info) -> str | None:
+        """Render the update timestamp as an ISO-8601 string for the API."""
         return value.isoformat() if value else None
 
     model_config = {"from_attributes": True}
 
 
 class FanControlAction(BaseModel):
+    """Imperative fan action: manual speed, automatic mode, reset, or cycle."""
     action: str = Field(pattern="^(set_manual|set_auto|reset|run_cycle)$")
     speed: Optional[int] = Field(default=None, ge=1, le=100)
 
 
 class FanTelemetryItem(BaseModel):
+    """One fan reading and the source of its percentage value."""
     name: str
     member_id: str
     rpm: int
@@ -174,6 +179,7 @@ class FanTelemetryItem(BaseModel):
 
 
 class FanTelemetryResponse(BaseModel):
+    """Live fan snapshot for a server, including per-fan provenance."""
     server_id: int
     server_name: str
     collected_at: datetime
@@ -182,6 +188,7 @@ class FanTelemetryResponse(BaseModel):
 
     @field_serializer("collected_at")
     def serialize_collected_at(self, value: datetime, _info) -> str:
+        """Render the collection timestamp as an ISO-8601 string."""
         return value.isoformat()
 
 

@@ -27,6 +27,7 @@ router = APIRouter(prefix="/users", tags=["users"])
 
 
 class UserCreate(BaseModel):
+    """Payload for creating a DSM user and optionally syncing it to iDRAC."""
     username: str = Field(..., min_length=2, max_length=64)
     email: Optional[str] = Field(None, max_length=128)
     password: str = Field(..., min_length=8)
@@ -36,6 +37,7 @@ class UserCreate(BaseModel):
 
 
 class UserUpdate(BaseModel):
+    """Partial user update; only supplied fields are applied."""
     email: Optional[str] = None
     password: Optional[str] = Field(None, min_length=8)
     is_active: Optional[bool] = None
@@ -45,6 +47,7 @@ class UserUpdate(BaseModel):
 
 
 class UserListResponse(BaseModel):
+    """User summary returned by the administration API."""
     id: int
     username: str
     email: Optional[str] = None
@@ -58,6 +61,7 @@ class UserListResponse(BaseModel):
 
 
 class PropagationResult(BaseModel):
+    """Outcome of propagating one user to one iDRAC controller."""
     server_id: int
     server_name: str
     status: str
@@ -65,6 +69,7 @@ class PropagationResult(BaseModel):
 
 
 class PropagationResponse(BaseModel):
+    """Aggregate propagation report across all targeted servers."""
     total: int
     success: int
     failed: int
