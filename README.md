@@ -6,29 +6,19 @@ A Linux package that gives you a single pane of glass to monitor and control mul
 
 ## Architecture
 
-```
-┌──────────────────────────────────────────────────┐
-│                    React / TypeScript SPA         │
-│              (dark theme, real-time UI)           │
-├──────────────────────────────────────────────────┤
-│                  FastAPI Backend                  │
-│                                                    │
-│  ┌──────────┐ ┌──────────┐ ┌──────────┐          │
-│  │ /servers │ │ /sensors │ │  /fans   │          │
-│  └──────────┘ └──────────┘ └──────────┘          │
-│                                                    │
-│  ┌──────────┐  ┌─────────────┐  ┌────────────┐   │
-│  │ MCP Server│  │ SensorPoller│  │ FanControl │   │
-│  │ (AI API)  │  │  (3s loop)  │  │ (stepped)  │   │
-│  └──────────┘  └─────────────┘  └────────────┘   │
-│                                                    │
-│  ┌─────────────┐ ┌──────────────┐                  │
-│  │ iDRAC7/8    │ │ SQLite DB    │                  │
-│  │ Connector   │ │ (encrypted)  │                  │
-│  │ Redfish+WSM │ └──────────────┘                  │
-│  └─────────────┘                                    │
-└──────────────────────────────────────────────────┘
-```
+<p align="center">
+  <img src="docs/architecture.svg" width="100%"
+       alt="DSM architecture: React and TypeScript SPA over HTTPS/JWT to a FastAPI backend that hosts the REST routes, MCP server, sensor poller and fan controller; SQLite stores state, and an iDRAC connector reaches Dell PowerEdge controllers over Redfish, WS-Man or IPMI.">
+</p>
+
+| Layer | Responsibility |
+|-------|----------------|
+| Client | React 18 + TypeScript SPA (Vite 5), dark theme, JWT session |
+| Application | FastAPI routes (`/auth`, `/servers`, `/sensors`, `/fans`, `/users`, `/groups`, `/temp-profiles`, `/settings`, `/health`, `/ws/telemetry`) |
+| Services | MCP server on `:8101`, 3-second sensor poller, stepped fan controller |
+| Persistence | SQLite (`dsm.db`) via SQLAlchemy 2.x + aiosqlite; stored iDRAC passwords encrypted with AES-256-CBC |
+| Controller | iDRAC connector with protocol auto-detection: Redfish REST, WS-Man SOAP, Dell OEM IPMI, `racadm` fallback |
+| Hardware | Dell PowerEdge 13G/14G — iDRAC 7/8 |
 
 ## Tech Stack
 
