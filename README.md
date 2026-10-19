@@ -236,3 +236,7 @@ Examples from verified 13G hardware:
 ## Target Servers
 
 R320, R720xd, R730, R530, R730xd, R640, R740, and other 13G/14G PowerEdge models.
+
+## License
+
+GNU General Public License v3.0 — see [LICENSE](LICENSE).
